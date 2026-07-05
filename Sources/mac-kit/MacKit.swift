@@ -5,9 +5,9 @@ import Foundation
 struct MacKit: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mac-kit",
-        abstract: "Native macOS system capabilities (MapKit, Safari) as MCP tools and CLI commands.",
+        abstract: "Native macOS system capabilities (MapKit, Safari, Vision OCR) as MCP tools and CLI commands.",
         version: MCPServer.serverVersion,
-        subcommands: [Serve.self, Search.self, Geocode.self, Eta.self, SafariCommand.self]
+        subcommands: [Serve.self, Search.self, Geocode.self, Eta.self, SafariCommand.self, Ocr.self]
     )
 }
 
@@ -75,6 +75,24 @@ struct Eta: AsyncParsableCommand {
 
     func run() async throws {
         print(try await etaText(from: from, to: to, transport: transport))
+    }
+}
+
+struct Ocr: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "ocr",
+        abstract: "Extract text from an image file via the Vision framework (on-device OCR)."
+    )
+
+    @Argument(help: "Path to the image (PNG/JPEG/HEIC/TIFF; ~ is expanded)")
+    var path: String
+
+    @Option(name: .customLong("lang"), help: "Comma-separated recognition languages")
+    var lang: String = defaultOCRLanguages.joined(separator: ",")
+
+    func run() throws {
+        let languages = lang.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        print(try ocrText(path: path, languages: languages))
     }
 }
 

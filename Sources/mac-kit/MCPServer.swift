@@ -137,6 +137,25 @@ struct MCPServer {
                 ],
                 "required": ["script"]
             ]
+        ],
+        [
+            "name": "vision_ocr",
+            "description": "Extract text from a local raster image (PNG/JPEG/HEIC/TIFF) using Apple's on-device Vision framework (VNRecognizeTextRequest, accurate mode). Returns text lines in reading order with per-line confidence. No network, no permissions needed.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "path": [
+                        "type": "string",
+                        "description": "Path to the image file (~ is expanded)"
+                    ],
+                    "languages": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Recognition language hints, e.g. [\"zh-Hans\", \"en-US\"] (the default)"
+                    ]
+                ],
+                "required": ["path"]
+            ]
         ]
     ]
 
@@ -240,6 +259,12 @@ struct MCPServer {
                     throw ToolError("safari_js requires \"script\"")
                 }
                 text = try safariJSText(script: script)
+            case "vision_ocr":
+                guard let path = args["path"] as? String, !path.isEmpty else {
+                    throw ToolError("vision_ocr requires \"path\"")
+                }
+                let languages = args["languages"] as? [String] ?? defaultOCRLanguages
+                text = try ocrText(path: path, languages: languages)
             default:
                 throw ToolError("Unknown tool: \(name)")
             }
