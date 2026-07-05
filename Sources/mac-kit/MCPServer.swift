@@ -61,6 +61,82 @@ struct MCPServer {
                 ],
                 "required": ["from", "to"]
             ]
+        ],
+        [
+            "name": "safari_open",
+            "description": "Open a URL in the real Safari browser (front window, reused if open) and wait for the page to finish loading (up to 15s). Returns final URL, title, and readyState. Requires Safari's \"Allow JavaScript from Apple Events\" developer setting.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "url": [
+                        "type": "string",
+                        "description": "URL to open; https:// is assumed if no scheme is given"
+                    ]
+                ],
+                "required": ["url"]
+            ]
+        ],
+        [
+            "name": "safari_snapshot",
+            "description": "Snapshot the interactive elements of Safari's front page: links, buttons, inputs, headings, etc. Each line is `[ref] role \"name\" (extra)`. Refs (e0, e1, ...) are used by safari_click/safari_fill and stay valid until the next snapshot. Capped at 150 elements.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [String: Any]()
+            ]
+        ],
+        [
+            "name": "safari_click",
+            "description": "Click an element in Safari's front page by snapshot ref (synthetic click). Returns ok plus the page's readyState/title/URL afterwards — re-run safari_snapshot if the page navigated.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "ref": [
+                        "type": "string",
+                        "description": "Element ref from the latest safari_snapshot, e.g. \"e12\""
+                    ]
+                ],
+                "required": ["ref"]
+            ]
+        ],
+        [
+            "name": "safari_fill",
+            "description": "Fill a text input, textarea, or contenteditable in Safari's front page by snapshot ref. Sets the value and dispatches input/change events (does not submit).",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "ref": [
+                        "type": "string",
+                        "description": "Element ref from the latest safari_snapshot, e.g. \"e3\""
+                    ],
+                    "text": [
+                        "type": "string",
+                        "description": "Text to fill in"
+                    ]
+                ],
+                "required": ["ref", "text"]
+            ]
+        ],
+        [
+            "name": "safari_read",
+            "description": "Read Safari's front page as text: title, URL, and body innerText (truncated to ~8000 chars).",
+            "inputSchema": [
+                "type": "object",
+                "properties": [String: Any]()
+            ]
+        ],
+        [
+            "name": "safari_js",
+            "description": "Run raw JavaScript in Safari's front page and return the result as a string. Escape hatch for anything the other safari_* tools don't cover.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "script": [
+                        "type": "string",
+                        "description": "JavaScript source to evaluate in the page"
+                    ]
+                ],
+                "required": ["script"]
+            ]
         ]
     ]
 
@@ -137,6 +213,33 @@ struct MCPServer {
                 }
                 let transport = args["transport"] as? String ?? "driving"
                 text = try await etaText(from: from, to: to, transport: transport)
+            case "safari_open":
+                guard let url = args["url"] as? String, !url.isEmpty else {
+                    throw ToolError("safari_open requires \"url\"")
+                }
+                text = try safariOpenText(url: url)
+            case "safari_snapshot":
+                text = try safariSnapshotText()
+            case "safari_click":
+                guard let ref = args["ref"] as? String, !ref.isEmpty else {
+                    throw ToolError("safari_click requires \"ref\"")
+                }
+                text = try safariClickText(ref: ref)
+            case "safari_fill":
+                guard let ref = args["ref"] as? String, !ref.isEmpty else {
+                    throw ToolError("safari_fill requires \"ref\"")
+                }
+                guard let fillText = args["text"] as? String else {
+                    throw ToolError("safari_fill requires \"text\"")
+                }
+                text = try safariFillText(ref: ref, text: fillText)
+            case "safari_read":
+                text = try safariReadText()
+            case "safari_js":
+                guard let script = args["script"] as? String, !script.isEmpty else {
+                    throw ToolError("safari_js requires \"script\"")
+                }
+                text = try safariJSText(script: script)
             default:
                 throw ToolError("Unknown tool: \(name)")
             }

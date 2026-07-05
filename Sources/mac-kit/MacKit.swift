@@ -5,9 +5,9 @@ import Foundation
 struct MacKit: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mac-kit",
-        abstract: "Native macOS system capabilities (MapKit) as MCP tools and CLI commands.",
+        abstract: "Native macOS system capabilities (MapKit, Safari) as MCP tools and CLI commands.",
         version: MCPServer.serverVersion,
-        subcommands: [Serve.self, Search.self, Geocode.self, Eta.self]
+        subcommands: [Serve.self, Search.self, Geocode.self, Eta.self, SafariCommand.self]
     )
 }
 
@@ -75,5 +75,99 @@ struct Eta: AsyncParsableCommand {
 
     func run() async throws {
         print(try await etaText(from: from, to: to, transport: transport))
+    }
+}
+
+// MARK: - Safari
+
+struct SafariCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "safari",
+        abstract: "Drive the real Safari browser via AppleScript/JXA (synthetic JS events).",
+        subcommands: [
+            SafariOpen.self, SafariSnapshot.self, SafariClick.self,
+            SafariFill.self, SafariRead.self, SafariJS.self
+        ]
+    )
+}
+
+struct SafariOpen: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "open",
+        abstract: "Open a URL in Safari's front window and wait for the page to load."
+    )
+
+    @Argument(help: "URL to open (https:// is assumed if no scheme given)")
+    var url: String
+
+    func run() throws {
+        print(try safariOpenText(url: url))
+    }
+}
+
+struct SafariSnapshot: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "snapshot",
+        abstract: "List interactive elements on the front page with refs (e0, e1, ...)."
+    )
+
+    func run() throws {
+        print(try safariSnapshotText())
+    }
+}
+
+struct SafariClick: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "click",
+        abstract: "Click an element by snapshot ref."
+    )
+
+    @Argument(help: "Element ref from the latest snapshot, e.g. e12")
+    var ref: String
+
+    func run() throws {
+        print(try safariClickText(ref: ref))
+    }
+}
+
+struct SafariFill: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "fill",
+        abstract: "Fill an input/textarea/contenteditable by snapshot ref."
+    )
+
+    @Argument(help: "Element ref from the latest snapshot, e.g. e3")
+    var ref: String
+
+    @Argument(help: "Text to fill in")
+    var text: String
+
+    func run() throws {
+        print(try safariFillText(ref: ref, text: text))
+    }
+}
+
+struct SafariRead: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "read",
+        abstract: "Read the front page's title, URL, and main text (~8000 chars)."
+    )
+
+    func run() throws {
+        print(try safariReadText())
+    }
+}
+
+struct SafariJS: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "js",
+        abstract: "Run raw JavaScript in the front page and print the result."
+    )
+
+    @Argument(help: "JavaScript source to evaluate")
+    var script: String
+
+    func run() throws {
+        print(try safariJSText(script: script))
     }
 }
