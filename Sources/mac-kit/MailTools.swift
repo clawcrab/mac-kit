@@ -1,0 +1,801 @@
+import Foundation
+import SQLite3
+
+// MARK: - Read-only SQLite wrapper
+//
+// Mail.app owns the Envelope Index and is actively syncing, so we open the
+// database strictly read-only (SQLITE_OPEN_READONLY), set a short busy
+// timeout, and never hold a transaction across calls: each query is a single
+// prepare/step/finalize.
+
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+final class ReadOnlyDB {
+    private var handle: OpaquePointer?
+
+    init(path: String) throws {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_READONLY
+        guard sqlite3_open_v2(path, &db, flags, nil) == SQLITE_OK, let db else {
+            let message = db.map { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
+            if let db { sqlite3_close_v2(db) }
+            throw ToolError("Cannot open \(path) read-only: \(message)")
+        }
+        sqlite3_busy_timeout(db, 3000)
+        handle = db
+    }
+
+    deinit {
+        if let handle { sqlite3_close_v2(handle) }
+    }
+
+    enum Value {
+        case null
+        case int(Int64)
+        case text(String)
+    }
+
+    /// Run one query with `?` bindings; returns rows of column values.
+    /// Values come back as text/int/null (Mail's schema uses no blobs we need).
+    func query(_ sql: String, _ bindings: [Value] = []) throws -> [[Value]] {
+        guard let handle else { throw ToolError("Database is closed") }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw ToolError("SQL prepare failed: \(String(cString: sqlite3_errmsg(handle)))")
+        }
+        defer { sqlite3_finalize(statement) }
+
+        for (index, value) in bindings.enumerated() {
+            let slot = Int32(index + 1)
+            switch value {
+            case .null: sqlite3_bind_null(statement, slot)
+            case .int(let number): sqlite3_bind_int64(statement, slot, number)
+            case .text(let string): sqlite3_bind_text(statement, slot, string, -1, sqliteTransient)
+            }
+        }
+
+        var rows: [[Value]] = []
+        while true {
+            let code = sqlite3_step(statement)
+            if code == SQLITE_ROW {
+                let count = sqlite3_column_count(statement)
+                var row: [Value] = []
+                for column in 0..<count {
+                    switch sqlite3_column_type(statement, column) {
+                    case SQLITE_NULL:
+                        row.append(.null)
+                    case SQLITE_INTEGER:
+                        row.append(.int(sqlite3_column_int64(statement, column)))
+                    default:
+                        if let text = sqlite3_column_text(statement, column) {
+                            row.append(.text(String(cString: text)))
+                        } else {
+                            row.append(.null)
+                        }
+                    }
+                }
+                rows.append(row)
+            } else if code == SQLITE_DONE {
+                break
+            } else {
+                throw ToolError("SQL step failed (\(code)): \(String(cString: sqlite3_errmsg(handle)))")
+            }
+        }
+        return rows
+    }
+}
+
+private extension ReadOnlyDB.Value {
+    var stringValue: String? {
+        switch self {
+        case .text(let string): return string
+        case .int(let number): return String(number)
+        case .null: return nil
+        }
+    }
+    var intValue: Int64? {
+        switch self {
+        case .int(let number): return number
+        case .text(let string): return Int64(string)
+        case .null: return nil
+        }
+    }
+}
+
+// MARK: - Mail store (Envelope Index + .emlx files)
+
+struct MailAccount {
+    let uuid: String       // directory name under ~/Library/Mail/V10/
+    let name: String       // e.g. "Google", "iCloud"
+    let email: String      // primary address, if known
+}
+
+struct MailStore {
+    let mailRoot: String   // ~/Library/Mail/V10
+    let db: ReadOnlyDB
+    let accounts: [MailAccount]      // uuid -> friendly name/email
+    let persistenceUUID: String      // per-store UUID used as mbox subdirectory
+
+    static let excludedMailboxNames: Set<String> = [
+        "junk", "spam", "trash", "deleted messages", "deleted items"
+    ]
+
+    init() throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        mailRoot = home + "/Library/Mail/V10"
+        let dbPath = mailRoot + "/MailData/Envelope Index"
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            throw ToolError("Mail index not found at \(dbPath) — is Mail.app set up on this Mac?")
+        }
+        db = try ReadOnlyDB(path: dbPath)
+
+        // The per-store UUID (subdirectory inside every .mbox) is recorded in
+        // the index's own properties table; fall back to PersistenceInfo.plist.
+        var uuid = ""
+        if let rows = try? db.query("SELECT value FROM properties WHERE key = 'UUID' LIMIT 1"),
+           let value = rows.first?.first?.stringValue {
+            uuid = value
+        }
+        if uuid.isEmpty,
+           let plist = NSDictionary(contentsOfFile: home + "/Library/Mail/PersistenceInfo.plist"),
+           let version = plist["LastUsedVersionDirectoryName"] as? String,
+           let identifiers = plist["VersionDirectoryIdentifiers"] as? [String: String],
+           let value = identifiers[version] {
+            uuid = value
+        }
+        persistenceUUID = uuid
+
+        accounts = Self.loadAccounts(home: home, mailDB: db)
+    }
+
+    /// Map Mail account UUIDs to human names by joining the system Accounts
+    /// store (each Mail account row's parent carries the description and
+    /// username). Best-effort: falls back to the bare UUID when unreadable.
+    private static func loadAccounts(home: String, mailDB: ReadOnlyDB) -> [MailAccount] {
+        var uuids: Set<String> = []
+        if let rows = try? mailDB.query("SELECT url FROM mailboxes") {
+            for row in rows {
+                if let url = row.first?.stringValue, let host = URL(string: url)?.host {
+                    uuids.insert(host)
+                }
+            }
+        }
+
+        var found: [MailAccount] = []
+        if let accountsDB = try? ReadOnlyDB(path: home + "/Library/Accounts/Accounts4.sqlite") {
+            for uuid in uuids.sorted() {
+                let sql = """
+                SELECT parent.ZACCOUNTDESCRIPTION, parent.ZUSERNAME
+                FROM ZACCOUNT child JOIN ZACCOUNT parent ON parent.Z_PK = child.ZPARENTACCOUNT
+                WHERE child.ZIDENTIFIER = ?
+                """
+                if let rows = try? accountsDB.query(sql, [.text(uuid)]), let row = rows.first {
+                    found.append(MailAccount(
+                        uuid: uuid,
+                        name: row[0].stringValue ?? uuid,
+                        email: row.count > 1 ? (row[1].stringValue ?? "") : ""
+                    ))
+                    continue
+                }
+                found.append(MailAccount(uuid: uuid, name: uuid, email: ""))
+            }
+        } else {
+            found = uuids.sorted().map { MailAccount(uuid: $0, name: $0, email: "") }
+        }
+        return found
+    }
+
+    func account(matching query: String) throws -> MailAccount {
+        let needle = query.lowercased()
+        if let exact = accounts.first(where: {
+            $0.uuid.lowercased() == needle || $0.name.lowercased() == needle || $0.email.lowercased() == needle
+        }) {
+            return exact
+        }
+        if let partial = accounts.first(where: {
+            $0.name.lowercased().contains(needle) || $0.email.lowercased().contains(needle)
+        }) {
+            return partial
+        }
+        let known = accounts.map { "\($0.name) <\($0.email)>" }.joined(separator: ", ")
+        throw ToolError("No Mail account matches \"\(query)\". Known accounts: \(known)")
+    }
+
+    func accountDisplay(forMailboxURL url: String) -> String {
+        guard let host = URL(string: url)?.host else { return "?" }
+        return accounts.first(where: { $0.uuid == host })?.name ?? host
+    }
+
+    /// "imap://UUID/%5BGmail%5D/All%20Mail" -> "All Mail"
+    static func mailboxName(fromURL url: String) -> String {
+        guard let components = URL(string: url)?.pathComponents else { return url }
+        let names = components.filter { $0 != "/" }
+        return names.last?.removingPercentEncoding ?? url
+    }
+
+    static func isExcludedMailbox(_ name: String) -> Bool {
+        excludedMailboxNames.contains(name.lowercased())
+    }
+
+    // MARK: Message queries
+
+    struct MessageRow {
+        let id: Int64
+        let dateReceived: Int64
+        let subject: String
+        let senderAddress: String
+        let senderName: String
+        let mailboxURL: String
+        let labelURLs: [String]
+    }
+
+    private static let baseSelect = """
+    SELECT m.ROWID, m.date_received, s.subject,
+           COALESCE(a.address, ''), COALESCE(a.comment, ''), mb.url,
+           (SELECT group_concat(mb2.url, char(10))
+              FROM labels l JOIN mailboxes mb2 ON mb2.ROWID = l.mailbox_id
+             WHERE l.message_id = m.ROWID)
+    FROM messages m
+    JOIN subjects s ON s.ROWID = m.subject
+    LEFT JOIN addresses a ON a.ROWID = m.sender
+    JOIN mailboxes mb ON mb.ROWID = m.mailbox
+    """
+
+    private func messageRows(where clause: String, bindings: [ReadOnlyDB.Value], limit: Int) throws -> [MessageRow] {
+        let sql = Self.baseSelect + """
+
+        WHERE \(clause)
+        ORDER BY m.date_received DESC
+        LIMIT \(limit)
+        """
+        return try db.query(sql, bindings).map { row in
+            MessageRow(
+                id: row[0].intValue ?? 0,
+                dateReceived: row[1].intValue ?? 0,
+                subject: row[2].stringValue ?? "",
+                senderAddress: row[3].stringValue ?? "",
+                senderName: row[4].stringValue ?? "",
+                mailboxURL: row[5].stringValue ?? "",
+                labelURLs: (row[6].stringValue ?? "").split(separator: "\n").map(String.init)
+            )
+        }
+    }
+
+    func unreadMessages(account: MailAccount?, limit: Int) throws -> [MessageRow] {
+        var clause = "m.read = 0 AND m.deleted = 0"
+        var bindings: [ReadOnlyDB.Value] = []
+        if let account {
+            clause += " AND mb.url LIKE ?"
+            bindings.append(.text("%://\(account.uuid)/%"))
+        }
+        // Overfetch: Gmail-style stores keep every message in "All Mail", so a
+        // chunk of candidates are archived (no INBOX label) and get filtered out.
+        let candidates = try messageRows(where: clause, bindings: bindings, limit: max(limit * 25, 500))
+
+        var results: [MessageRow] = []
+        for row in candidates {
+            let physical = Self.mailboxName(fromURL: row.mailboxURL)
+            if Self.isExcludedMailbox(physical) { continue }
+            if physical.lowercased() == "all mail" {
+                // Gmail archive: only surface messages still labeled INBOX,
+                // and show them as INBOX.
+                guard let inboxURL = row.labelURLs.first(where: {
+                    Self.mailboxName(fromURL: $0).uppercased() == "INBOX"
+                }) else { continue }
+                results.append(MessageRow(
+                    id: row.id, dateReceived: row.dateReceived, subject: row.subject,
+                    senderAddress: row.senderAddress, senderName: row.senderName,
+                    mailboxURL: inboxURL, labelURLs: row.labelURLs
+                ))
+            } else {
+                results.append(row)
+            }
+            if results.count >= limit { break }
+        }
+        return results
+    }
+
+    func searchMessages(query: String, account: MailAccount?, mailbox: String?,
+                        since: Int64?, limit: Int) throws -> [MessageRow] {
+        let escaped = query
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let pattern = "%\(escaped)%"
+        var clause = """
+        m.deleted = 0 AND (s.subject LIKE ? ESCAPE '\\'
+            OR a.address LIKE ? ESCAPE '\\' OR a.comment LIKE ? ESCAPE '\\')
+        """
+        var bindings: [ReadOnlyDB.Value] = [.text(pattern), .text(pattern), .text(pattern)]
+        if let account {
+            clause += " AND mb.url LIKE ?"
+            bindings.append(.text("%://\(account.uuid)/%"))
+        }
+        if let since {
+            clause += " AND m.date_received >= ?"
+            bindings.append(.int(since))
+        }
+        let candidates = try messageRows(where: clause, bindings: bindings,
+                                         limit: mailbox == nil ? limit : max(limit * 25, 500))
+        guard let mailbox else { return candidates }
+
+        // Mailbox filter matches the physical mailbox or any Gmail label.
+        let wanted = mailbox.lowercased()
+        var results: [MessageRow] = []
+        for row in candidates {
+            let names = [Self.mailboxName(fromURL: row.mailboxURL)]
+                + row.labelURLs.map { Self.mailboxName(fromURL: $0) }
+            if names.contains(where: { $0.lowercased() == wanted }) {
+                results.append(row)
+                if results.count >= limit { break }
+            }
+        }
+        return results
+    }
+
+    struct MessageDetail {
+        let row: MessageRow
+        let toLine: String
+        let ccLine: String
+    }
+
+    func messageDetail(id: Int64) throws -> MessageDetail {
+        let rows = try messageRows(where: "m.ROWID = ?", bindings: [.int(id)], limit: 1)
+        guard let row = rows.first else {
+            throw ToolError("No message with id \(id) — use mail_search to find valid ids")
+        }
+        let recipientSQL = """
+        SELECT r.type, COALESCE(a.address, ''), COALESCE(a.comment, '')
+        FROM recipients r JOIN addresses a ON a.ROWID = r.address
+        WHERE r.message = ? ORDER BY r.type, r.position
+        """
+        var to: [String] = []
+        var cc: [String] = []
+        for recipient in try db.query(recipientSQL, [.int(id)]) {
+            let display = Self.formatAddress(
+                address: recipient[1].stringValue ?? "",
+                name: recipient[2].stringValue ?? ""
+            )
+            switch recipient[0].intValue ?? 0 {
+            case 0: to.append(display)
+            case 1: cc.append(display)
+            default: break // bcc rows exist only for sent mail; omit
+            }
+        }
+        return MessageDetail(row: row, toLine: to.joined(separator: ", "),
+                             ccLine: cc.joined(separator: ", "))
+    }
+
+    static func formatAddress(address: String, name: String) -> String {
+        if name.isEmpty { return address }
+        if address.isEmpty { return name }
+        return "\(name) <\(address)>"
+    }
+
+    // MARK: .emlx location
+    //
+    // Layout on disk (verified empirically on macOS 26 / Mail V10):
+    //   ~/Library/Mail/V10/<AccountUUID>/<Mailbox>.mbox[/<Sub>.mbox...]/
+    //     <PersistenceUUID>/Data/<digit dirs>/Messages/<ROWID>.emlx
+    // where <ROWID> is messages.ROWID in the Envelope Index and the digit
+    // directories are the decimal digits of ROWID/1000, least significant
+    // first (e.g. ROWID 19074 -> Data/9/1/Messages/19074.emlx; ROWID < 1000
+    // -> Data/Messages/<ROWID>.emlx). Partially downloaded messages are
+    // stored as <ROWID>.partial.emlx.
+
+    func emlxPath(mailboxURL: String, messageID: Int64) -> String? {
+        guard let url = URL(string: mailboxURL), let host = url.host else { return nil }
+        var path = mailRoot + "/" + host
+        for component in url.pathComponents where component != "/" {
+            path += "/" + (component.removingPercentEncoding ?? component) + ".mbox"
+        }
+        path += "/" + persistenceUUID + "/Data"
+        let thousands = messageID / 1000
+        if thousands > 0 {
+            for digit in String(thousands).reversed() {
+                path += "/" + String(digit)
+            }
+        }
+        path += "/Messages"
+        let full = path + "/\(messageID).emlx"
+        if FileManager.default.fileExists(atPath: full) { return full }
+        let partial = path + "/\(messageID).partial.emlx"
+        if FileManager.default.fileExists(atPath: partial) { return partial }
+        return nil
+    }
+}
+
+// MARK: - .emlx / MIME parsing (MVP: text/plain preferred, crude HTML strip)
+
+enum EmlxParser {
+    /// An .emlx file is "<byte count>\n<RFC 822 message><XML plist>"; the
+    /// count covers just the message.
+    static func messageData(fromEmlx data: Data) -> Data {
+        guard let newline = data.firstIndex(of: 0x0A) else { return data }
+        let header = String(decoding: data[..<newline], as: UTF8.self)
+            .trimmingCharacters(in: .whitespaces)
+        let start = data.index(after: newline)
+        guard let count = Int(header), count > 0, start + count <= data.count else {
+            return data.subdata(in: start..<data.count)
+        }
+        return data.subdata(in: start..<(start + count))
+    }
+
+    struct Part {
+        let headers: [String: String]   // lowercased header name -> unfolded value
+        let body: Data
+    }
+
+    static func splitHeaders(_ data: Data) -> Part {
+        // Find the blank line separating headers from body (\r\n\r\n or \n\n).
+        var headerEnd = data.count
+        var bodyStart = data.count
+        let bytes = [UInt8](data)
+        var index = 0
+        while index < bytes.count - 1 {
+            if bytes[index] == 0x0A {
+                if bytes[index + 1] == 0x0A {
+                    headerEnd = index; bodyStart = index + 2; break
+                }
+                if index + 2 < bytes.count, bytes[index + 1] == 0x0D, bytes[index + 2] == 0x0A {
+                    headerEnd = index; bodyStart = index + 3; break
+                }
+            }
+            index += 1
+        }
+        let headerText = String(decoding: data[..<headerEnd], as: UTF8.self)
+        var headers: [String: String] = [:]
+        var currentName: String?
+        for rawLine in headerText.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : String(rawLine)
+            if line.first == " " || line.first == "\t" {
+                if let name = currentName {
+                    headers[name, default: ""] += " " + line.trimmingCharacters(in: .whitespaces)
+                }
+            } else if let colon = line.firstIndex(of: ":") {
+                let name = String(line[..<colon]).lowercased()
+                currentName = name
+                let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+                if let existing = headers[name] {
+                    headers[name] = existing + ", " + value
+                } else {
+                    headers[name] = value
+                }
+            }
+        }
+        return Part(headers: headers, body: data.subdata(in: min(bodyStart, data.count)..<data.count))
+    }
+
+    static func contentType(of part: Part) -> (type: String, parameters: [String: String]) {
+        guard let raw = part.headers["content-type"] else { return ("text/plain", [:]) }
+        let pieces = raw.split(separator: ";")
+        let type = pieces.first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? "text/plain"
+        var parameters: [String: String] = [:]
+        for piece in pieces.dropFirst() {
+            guard let equals = piece.firstIndex(of: "=") else { continue }
+            let key = piece[..<equals].trimmingCharacters(in: .whitespaces).lowercased()
+            var value = piece[piece.index(after: equals)...].trimmingCharacters(in: .whitespaces)
+            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            }
+            parameters[key] = value
+        }
+        return (type, parameters)
+    }
+
+    static func decodeTransferEncoding(_ body: Data, encoding: String?) -> Data {
+        switch (encoding ?? "").lowercased() {
+        case "base64":
+            let text = String(decoding: body, as: UTF8.self)
+                .filter { !$0.isWhitespace }
+            return Data(base64Encoded: text) ?? body
+        case "quoted-printable":
+            return decodeQuotedPrintable(body)
+        default:
+            return body
+        }
+    }
+
+    static func decodeQuotedPrintable(_ data: Data) -> Data {
+        var output = Data(capacity: data.count)
+        let bytes = [UInt8](data)
+        var index = 0
+        func hexValue(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case 0x30...0x39: return byte - 0x30
+            case 0x41...0x46: return byte - 0x41 + 10
+            case 0x61...0x66: return byte - 0x61 + 10
+            default: return nil
+            }
+        }
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == 0x3D { // '='
+                if index + 1 < bytes.count, bytes[index + 1] == 0x0A {
+                    index += 2; continue // soft break "=\n"
+                }
+                if index + 2 < bytes.count, bytes[index + 1] == 0x0D, bytes[index + 2] == 0x0A {
+                    index += 3; continue // soft break "=\r\n"
+                }
+                if index + 2 < bytes.count,
+                   let high = hexValue(bytes[index + 1]), let low = hexValue(bytes[index + 2]) {
+                    output.append(high << 4 | low)
+                    index += 3; continue
+                }
+            }
+            output.append(byte)
+            index += 1
+        }
+        return output
+    }
+
+    static func string(from data: Data, charset: String?) -> String {
+        let name = (charset ?? "utf-8").lowercased()
+        let encoding: String.Encoding
+        switch name {
+        case "utf-8", "us-ascii", "ascii": encoding = .utf8
+        case "iso-8859-1", "latin1": encoding = .isoLatin1
+        case "windows-1252", "cp1252": encoding = .windowsCP1252
+        case "utf-16": encoding = .utf16
+        default: encoding = .utf8
+        }
+        return String(data: data, encoding: encoding) ?? String(decoding: data, as: UTF8.self)
+    }
+
+    /// Walk the MIME tree and pick the best text body: text/plain wins,
+    /// then text/html (crudely tag-stripped).
+    static func bestBodyText(from part: Part, depth: Int = 0) -> String? {
+        let (type, parameters) = contentType(of: part)
+        if type.hasPrefix("multipart/"), depth < 4, let boundary = parameters["boundary"] {
+            var plain: String?
+            var html: String?
+            for sub in splitMultipart(part.body, boundary: boundary) {
+                let subPart = splitHeaders(sub)
+                let (subType, _) = contentType(of: subPart)
+                if let text = bestBodyText(from: subPart, depth: depth + 1) {
+                    if subType.hasPrefix("multipart/") || subType == "text/plain" {
+                        if plain == nil { plain = text }
+                    } else if subType == "text/html" {
+                        if html == nil { html = text }
+                    } else if plain == nil, subType.hasPrefix("text/") {
+                        plain = text
+                    }
+                }
+                if plain != nil { break }
+            }
+            return plain ?? html
+        }
+        guard type.hasPrefix("text/") else { return nil }
+        let decoded = decodeTransferEncoding(part.body, encoding: part.headers["content-transfer-encoding"])
+        var text = string(from: decoded, charset: parameters["charset"])
+        if type == "text/html" {
+            text = stripHTML(text)
+        }
+        return text.replacingOccurrences(of: "\r\n", with: "\n")
+    }
+
+    static func splitMultipart(_ body: Data, boundary: String) -> [Data] {
+        let text = String(decoding: body, as: UTF8.self)
+        let marker = "--" + boundary
+        var parts: [String] = []
+        var current: [Substring] = []
+        var inside = false
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.hasSuffix("\r") ? line.dropLast() : line[...]
+            if trimmed == Substring(marker) || trimmed == Substring(marker + "--") {
+                if inside, !current.isEmpty {
+                    parts.append(current.joined(separator: "\n"))
+                }
+                current = []
+                inside = trimmed == Substring(marker)
+                if !inside { break }
+            } else if inside {
+                current.append(line)
+            }
+        }
+        return parts.map { Data($0.utf8) }
+    }
+
+    static func stripHTML(_ html: String) -> String {
+        var text = html
+        for block in ["script", "style", "head"] {
+            text = text.replacingOccurrences(
+                of: "<\(block)[^>]*>[\\s\\S]*?</\(block)>",
+                with: "", options: [.regularExpression, .caseInsensitive]
+            )
+        }
+        text = text.replacingOccurrences(
+            of: "<(br|/p|/div|/tr|/h[1-6]|/li)[^>]*>",
+            with: "\n", options: [.regularExpression, .caseInsensitive]
+        )
+        text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        let entities: [(String, String)] = [
+            ("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+            ("&quot;", "\""), ("&#39;", "'"), ("&rsquo;", "'"), ("&mdash;", "—"),
+            ("&copy;", "©"), ("&reg;", "®"), ("&zwnj;", ""), ("&zwj;", "")
+        ]
+        for (entity, replacement) in entities {
+            text = text.replacingOccurrences(of: entity, with: replacement)
+        }
+        // Collapse the whitespace storms typical of marketing HTML.
+        text = text.replacingOccurrences(of: "[ \t]+", with: " ", options: .regularExpression)
+        text = text.replacingOccurrences(of: " ?\n ?", with: "\n", options: .regularExpression)
+        text = text.replacingOccurrences(of: "\n{3,}", with: "\n\n", options: .regularExpression)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - Formatting
+
+private let mailDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm"
+    return formatter
+}()
+
+private func formatEpoch(_ epoch: Int64) -> String {
+    guard epoch > 0 else { return "?" }
+    return mailDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+}
+
+private func formatRow(_ row: MailStore.MessageRow, store: MailStore, index: Int) -> String {
+    let sender = MailStore.formatAddress(address: row.senderAddress, name: row.senderName)
+    let account = store.accountDisplay(forMailboxURL: row.mailboxURL)
+    let mailbox = MailStore.mailboxName(fromURL: row.mailboxURL)
+    let subject = row.subject.isEmpty ? "(no subject)" : row.subject
+    return """
+    \(index). [\(row.id)] \(formatEpoch(row.dateReceived))  \(subject)
+       From: \(sender)  (\(account) / \(mailbox))
+    """
+}
+
+private func parseSinceDate(_ since: String) throws -> Int64 {
+    let iso = ISO8601DateFormatter()
+    if let date = iso.date(from: since) {
+        return Int64(date.timeIntervalSince1970)
+    }
+    let dayFormatter = DateFormatter()
+    dayFormatter.dateFormat = "yyyy-MM-dd"
+    dayFormatter.timeZone = TimeZone.current
+    if let date = dayFormatter.date(from: since) {
+        return Int64(date.timeIntervalSince1970)
+    }
+    throw ToolError("Cannot parse since date \"\(since)\" — use ISO format like 2026-07-01")
+}
+
+// MARK: - Tool implementations
+
+func mailUnreadText(account: String?, limit: Int) throws -> String {
+    let store = try MailStore()
+    let filter = try account.map { try store.account(matching: $0) }
+    let rows = try store.unreadMessages(account: filter, limit: max(1, limit))
+    if rows.isEmpty { return "No unread messages." }
+    var lines = ["\(rows.count) unread (newest first; id in brackets for mail_read):"]
+    for (index, row) in rows.enumerated() {
+        lines.append(formatRow(row, store: store, index: index + 1))
+    }
+    return lines.joined(separator: "\n")
+}
+
+func mailSearchText(query: String, account: String?, mailbox: String?,
+                    since: String?, limit: Int) throws -> String {
+    let store = try MailStore()
+    let filter = try account.map { try store.account(matching: $0) }
+    let sinceEpoch = try since.map { try parseSinceDate($0) }
+    let rows = try store.searchMessages(query: query, account: filter, mailbox: mailbox,
+                                        since: sinceEpoch, limit: max(1, limit))
+    if rows.isEmpty { return "No messages match \"\(query)\"." }
+    var lines = ["\(rows.count) match(es) for \"\(query)\" (newest first; id in brackets for mail_read):"]
+    for (index, row) in rows.enumerated() {
+        lines.append(formatRow(row, store: store, index: index + 1))
+    }
+    return lines.joined(separator: "\n")
+}
+
+func mailReadText(id: Int64) throws -> String {
+    let store = try MailStore()
+    let detail = try store.messageDetail(id: id)
+    let row = detail.row
+
+    var lines: [String] = []
+    lines.append("Subject: \(row.subject.isEmpty ? "(no subject)" : row.subject)")
+    lines.append("From: \(MailStore.formatAddress(address: row.senderAddress, name: row.senderName))")
+    if !detail.toLine.isEmpty { lines.append("To: \(detail.toLine)") }
+    if !detail.ccLine.isEmpty { lines.append("Cc: \(detail.ccLine)") }
+    lines.append("Date: \(formatEpoch(row.dateReceived))")
+    var location = "\(store.accountDisplay(forMailboxURL: row.mailboxURL)) / \(MailStore.mailboxName(fromURL: row.mailboxURL))"
+    let labels = row.labelURLs.map { MailStore.mailboxName(fromURL: $0) }
+    if !labels.isEmpty {
+        location += "  (labels: \(labels.joined(separator: ", ")))"
+    }
+    lines.append("Mailbox: \(location)")
+    lines.append("")
+
+    if let path = store.emlxPath(mailboxURL: row.mailboxURL, messageID: row.id),
+       let raw = FileManager.default.contents(atPath: path) {
+        let message = EmlxParser.messageData(fromEmlx: raw)
+        let part = EmlxParser.splitHeaders(message)
+        if var body = EmlxParser.bestBodyText(from: part), !body.isEmpty {
+            let cap = 6000
+            if body.count > cap {
+                let cut = body.index(body.startIndex, offsetBy: cap)
+                body = String(body[..<cut]) + "\n\n[truncated: showing \(cap) of \(body.count) chars]"
+            }
+            if path.hasSuffix(".partial.emlx") {
+                lines.append("[note: message only partially downloaded — attachments missing]")
+            }
+            lines.append(body)
+        } else {
+            lines.append("[no text body found in \(path.hasSuffix(".partial.emlx") ? "partial " : "")message file]")
+        }
+    } else {
+        lines.append("[body not downloaded yet — Mail.app has only synced this message's metadata]")
+    }
+    return lines.joined(separator: "\n")
+}
+
+func mailSendText(to: String, subject: String, body: String,
+                  fromAccount: String?, cc: String?, bcc: String?) throws -> String {
+    func addressList(_ raw: String?) -> [String] {
+        (raw ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+    let toList = addressList(to)
+    guard !toList.isEmpty else { throw ToolError("mail_send requires at least one \"to\" address") }
+
+    let source = """
+    function run() {
+      const Mail = Application('Mail');
+      const to = \(jsLiteral(toList.joined(separator: "\n"))).split('\\n');
+      const cc = \(jsLiteral(addressList(cc).joined(separator: "\n")));
+      const bcc = \(jsLiteral(addressList(bcc).joined(separator: "\n")));
+      const fromQuery = \(jsLiteral(fromAccount ?? ""));
+
+      let sender = null;
+      if (fromQuery) {
+        const needle = fromQuery.toLowerCase();
+        const names = [];
+        for (const account of Mail.accounts()) {
+          const name = String(account.name());
+          const emails = account.emailAddresses().map(String);
+          names.push(name + ' <' + emails.join(', ') + '>');
+          if (name.toLowerCase() === needle
+              || emails.some(e => e.toLowerCase() === needle)) {
+            sender = String(account.fullName()) + ' <' + emails[0] + '>';
+            break;
+          }
+        }
+        if (!sender) {
+          return 'ERR: no Mail account matches "' + fromQuery + '". Accounts: ' + names.join('; ');
+        }
+      }
+
+      const msg = Mail.OutgoingMessage({
+        subject: \(jsLiteral(subject)),
+        content: \(jsLiteral(body)),
+        visible: false
+      });
+      Mail.outgoingMessages.push(msg);
+      if (sender) { msg.sender = sender; }
+      for (const address of to) {
+        msg.toRecipients.push(Mail.ToRecipient({address: address}));
+      }
+      if (cc) {
+        for (const address of cc.split('\\n')) {
+          msg.ccRecipients.push(Mail.CcRecipient({address: address}));
+        }
+      }
+      if (bcc) {
+        for (const address of bcc.split('\\n')) {
+          msg.bccRecipients.push(Mail.BccRecipient({address: address}));
+        }
+      }
+      Mail.send(msg);
+      return 'Sent "' + \(jsLiteral(subject)) + '" to ' + to.join(', ')
+        + (sender ? ' from ' + sender : ' from the default account');
+    }
+    """
+    let result = try runJXA(source, timeout: 30)
+    if result.hasPrefix("ERR:") { throw ToolError(String(result.dropFirst(4)).trimmingCharacters(in: .whitespaces)) }
+    return result
+}

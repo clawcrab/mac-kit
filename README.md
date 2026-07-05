@@ -1,6 +1,6 @@
 # mac-kit
 
-Native macOS system capabilities exposed as [MCP](https://modelcontextprotocol.io) tools: Apple Maps (MapKit / CoreLocation), Safari browser automation, and on-device OCR (Vision framework). A single small executable that works both as an MCP stdio server and as a plain CLI for debugging.
+Native macOS system capabilities exposed as [MCP](https://modelcontextprotocol.io) tools: Apple Maps (MapKit / CoreLocation), Safari browser automation, on-device OCR (Vision framework), and Apple Mail (local index reads + sending via Mail.app). A single small executable that works both as an MCP stdio server and as a plain CLI for debugging.
 
 No API keys, no location permission, no entitlements — all inputs are explicit strings, resolved through Apple's public MapKit/CLGeocoder/Vision APIs and Safari's AppleScript interface.
 
@@ -69,13 +69,33 @@ Snapshot refs (`e0`, `e1`, ...) are stored in the page (`window.__mk`) and stay 
 - Clicks and fills are synthetic DOM events. Most sites are fine with this; heavily framework-bound widgets occasionally need the `safari js` escape hatch.
 - Main document only — elements inside cross-origin iframes are not visible to the snapshot.
 
+## Mail
+
+Requires Mail.app with at least one account configured. Reads go straight to Mail's local **Envelope Index** (SQLite, opened strictly read-only with a busy timeout — mac-kit never writes to Mail's data, and Mail.app can keep syncing while you query). Message bodies are parsed from Mail's on-disk `.emlx` files; if Mail hasn't downloaded a body yet (fresh account sync), you still get the metadata plus a "body not downloaded yet" note. Sending goes through Mail.app itself via AppleScript, so sent mail lands in your normal Sent mailbox — the first send triggers a one-time macOS Automation permission prompt for Mail.
+
+```sh
+mac-kit mail unread                                 # unread across all accounts, newest first
+mac-kit mail unread --account Google --limit 10
+mac-kit mail search "Alaska" --since 2026-06-01     # matches subject or sender
+mac-kit mail search invoice --account iCloud --mailbox INBOX
+mac-kit mail read 31797                             # id from search/unread output
+mac-kit mail send you@example.com --subject "Hi" --body "..." --from Google
+```
+
+Notes:
+
+- `unread` excludes Junk/Trash/Spam, and for Gmail-style accounts only shows messages still in INBOX (archived unread are skipped).
+- `search` matches subject and sender name/address, case-insensitively; `--mailbox` also matches Gmail labels.
+- `read` prefers the `text/plain` MIME part and falls back to crudely tag-stripped HTML, truncated to ~6000 chars.
+- `send` sends immediately (no draft step). Pick the account with `--from` by account name or address; otherwise Mail's default account is used.
+
 ## MCP server
 
 ```sh
 mac-kit serve
 ```
 
-Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes ten tools:
+Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes fourteen tools:
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
@@ -89,6 +109,10 @@ Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes ten tools:
 | `safari_read` | — | Title + URL + page text (~8000 chars) |
 | `safari_js` | `script` (required) | Result of evaluating the script in the page |
 | `vision_ocr` | `path` (required), `languages` (default `["zh-Hans","en-US"]`) | Recognized text lines in reading order with confidence |
+| `mail_unread` | `account`, `limit` (default 20) | Unread messages, newest first: `[id] date subject / from (account / mailbox)` |
+| `mail_search` | `query` (required), `account`, `mailbox`, `since`, `limit` (default 20) | Matching messages in the same shape, with ids for `mail_read` |
+| `mail_read` | `id` (required) | Headers (from/to/cc/date/subject/mailbox) + text body (~6000 chars) |
+| `mail_send` | `to`, `subject`, `body` (required), `from_account`, `cc`, `bcc` | Send confirmation (sends immediately via Mail.app) |
 
 ### Wiring into an MCP client
 

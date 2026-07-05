@@ -7,7 +7,10 @@ struct MacKit: AsyncParsableCommand {
         commandName: "mac-kit",
         abstract: "Native macOS system capabilities (MapKit, Safari, Vision OCR) as MCP tools and CLI commands.",
         version: MCPServer.serverVersion,
-        subcommands: [Serve.self, Search.self, Geocode.self, Eta.self, SafariCommand.self, Ocr.self]
+        subcommands: [
+            Serve.self, Search.self, Geocode.self, Eta.self, SafariCommand.self,
+            Ocr.self, MailCommand.self
+        ]
     )
 }
 
@@ -173,6 +176,104 @@ struct SafariRead: ParsableCommand {
 
     func run() throws {
         print(try safariReadText())
+    }
+}
+
+// MARK: - Mail
+
+struct MailCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "mail",
+        abstract: "Read Apple Mail's local index (read-only) and send via Mail.app.",
+        subcommands: [MailUnread.self, MailSearch.self, MailRead.self, MailSend.self]
+    )
+}
+
+struct MailUnread: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "unread",
+        abstract: "List unread messages across accounts (Junk/Trash/Spam excluded)."
+    )
+
+    @Option(help: "Only this account (name like \"Google\" or an address)")
+    var account: String?
+
+    @Option(help: "Max results")
+    var limit: Int = 20
+
+    func run() throws {
+        print(try mailUnreadText(account: account, limit: limit))
+    }
+}
+
+struct MailSearch: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "search",
+        abstract: "Search messages by subject or sender (case-insensitive)."
+    )
+
+    @Argument(help: "Text to match against subject and sender name/address")
+    var query: String
+
+    @Option(help: "Only this account (name or address)")
+    var account: String?
+
+    @Option(help: "Only this mailbox by name, e.g. INBOX or Archive")
+    var mailbox: String?
+
+    @Option(help: "Only messages received on/after this ISO date, e.g. 2026-06-01")
+    var since: String?
+
+    @Option(help: "Max results")
+    var limit: Int = 20
+
+    func run() throws {
+        print(try mailSearchText(query: query, account: account, mailbox: mailbox,
+                                 since: since, limit: limit))
+    }
+}
+
+struct MailRead: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "read",
+        abstract: "Read one message (headers + text body) by id from mail search/unread."
+    )
+
+    @Argument(help: "Message id, e.g. 31797")
+    var id: Int64
+
+    func run() throws {
+        print(try mailReadText(id: id))
+    }
+}
+
+struct MailSend: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "send",
+        abstract: "Send an email via Mail.app (AppleScript). Sends immediately."
+    )
+
+    @Argument(help: "Recipient address(es), comma-separated")
+    var to: String
+
+    @Option(help: "Subject line")
+    var subject: String
+
+    @Option(help: "Plain-text body")
+    var body: String
+
+    @Option(name: .customLong("from"), help: "Sending account (name or address); Mail's default if omitted")
+    var fromAccount: String?
+
+    @Option(help: "Cc address(es), comma-separated")
+    var cc: String?
+
+    @Option(help: "Bcc address(es), comma-separated")
+    var bcc: String?
+
+    func run() throws {
+        print(try mailSendText(to: to, subject: subject, body: body,
+                               fromAccount: fromAccount, cc: cc, bcc: bcc))
     }
 }
 

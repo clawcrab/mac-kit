@@ -156,6 +156,77 @@ struct MCPServer {
                 ],
                 "required": ["path"]
             ]
+        ],
+        [
+            "name": "mail_unread",
+            "description": "List unread messages from Apple Mail's local index (read-only), newest first, across all accounts or one. Junk/Trash/Spam are excluded; Gmail-style accounts show only messages still in INBOX (archived unread are skipped). Each line starts with [id] for mail_read.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "account": [
+                        "type": "string",
+                        "description": "Optional account filter: account name (e.g. \"Google\", \"iCloud\") or an email address on the account"
+                    ],
+                    "limit": ["type": "integer", "description": "Max results (default 20)"]
+                ]
+            ]
+        ],
+        [
+            "name": "mail_search",
+            "description": "Search Apple Mail's local index (read-only) by subject or sender name/address (case-insensitive substring). Returns date, from, subject, account/mailbox, newest first, with [id] for mail_read.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "query": [
+                        "type": "string",
+                        "description": "Text matched against subject and sender name/address"
+                    ],
+                    "account": [
+                        "type": "string",
+                        "description": "Optional account filter (name or address)"
+                    ],
+                    "mailbox": [
+                        "type": "string",
+                        "description": "Optional mailbox name filter, e.g. \"INBOX\" or \"Archive\" (matches Gmail labels too)"
+                    ],
+                    "since": [
+                        "type": "string",
+                        "description": "Optional ISO date; only messages received on/after it, e.g. \"2026-06-01\""
+                    ],
+                    "limit": ["type": "integer", "description": "Max results (default 20)"]
+                ],
+                "required": ["query"]
+            ]
+        ],
+        [
+            "name": "mail_read",
+            "description": "Read one message by id (from mail_search/mail_unread): headers (from/to/cc/date/subject/mailbox) plus the text body (text/plain preferred, HTML tag-stripped otherwise), truncated to ~6000 chars. If Mail.app hasn't downloaded the body yet, returns metadata with a note.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "id": ["type": "integer", "description": "Message id from mail_search or mail_unread"]
+                ],
+                "required": ["id"]
+            ]
+        ],
+        [
+            "name": "mail_send",
+            "description": "Send an email through Mail.app (AppleScript) — sends immediately, no draft step. Optionally pick the sending account by name or address; otherwise Mail's default account is used. Requires macOS Automation permission for Mail.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "to": ["type": "string", "description": "Recipient address(es), comma-separated"],
+                    "subject": ["type": "string", "description": "Subject line"],
+                    "body": ["type": "string", "description": "Plain-text body"],
+                    "from_account": [
+                        "type": "string",
+                        "description": "Optional sending account: account name (e.g. \"Google\") or an address on it"
+                    ],
+                    "cc": ["type": "string", "description": "Cc address(es), comma-separated"],
+                    "bcc": ["type": "string", "description": "Bcc address(es), comma-separated"]
+                ],
+                "required": ["to", "subject", "body"]
+            ]
         ]
     ]
 
@@ -265,6 +336,42 @@ struct MCPServer {
                 }
                 let languages = args["languages"] as? [String] ?? defaultOCRLanguages
                 text = try ocrText(path: path, languages: languages)
+            case "mail_unread":
+                let account = args["account"] as? String
+                let limit = (args["limit"] as? NSNumber)?.intValue ?? 20
+                text = try mailUnreadText(account: account, limit: limit)
+            case "mail_search":
+                guard let query = args["query"] as? String, !query.isEmpty else {
+                    throw ToolError("mail_search requires \"query\"")
+                }
+                text = try mailSearchText(
+                    query: query,
+                    account: args["account"] as? String,
+                    mailbox: args["mailbox"] as? String,
+                    since: args["since"] as? String,
+                    limit: (args["limit"] as? NSNumber)?.intValue ?? 20
+                )
+            case "mail_read":
+                guard let id = (args["id"] as? NSNumber)?.int64Value else {
+                    throw ToolError("mail_read requires numeric \"id\" from mail_search/mail_unread")
+                }
+                text = try mailReadText(id: id)
+            case "mail_send":
+                guard let to = args["to"] as? String, !to.isEmpty else {
+                    throw ToolError("mail_send requires \"to\"")
+                }
+                guard let subject = args["subject"] as? String else {
+                    throw ToolError("mail_send requires \"subject\"")
+                }
+                guard let body = args["body"] as? String else {
+                    throw ToolError("mail_send requires \"body\"")
+                }
+                text = try mailSendText(
+                    to: to, subject: subject, body: body,
+                    fromAccount: args["from_account"] as? String,
+                    cc: args["cc"] as? String,
+                    bcc: args["bcc"] as? String
+                )
             default:
                 throw ToolError("Unknown tool: \(name)")
             }
