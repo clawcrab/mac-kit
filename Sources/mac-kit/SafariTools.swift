@@ -286,15 +286,70 @@ func safariOpenText(url: String) throws -> String {
     let source = """
     function run() {
       const Safari = Application('Safari');
+      const target = \(jsLiteral(target));
+      // Compare URLs ignoring a trailing slash: Safari reports
+      // "https://x.com/" for a "https://x.com" request.
+      const norm = (u) => String(u || '').replace(/\\/+$/, '');
       if (Safari.documents.length === 0) {
         Safari.documents.push(Safari.Document());
       }
-      Safari.documents[0].url = \(jsLiteral(target));
-      delay(0.5);
+      const readDoc = () => {
+        let u = '', t = '';
+        try { u = String(Safari.documents[0].url() || ''); } catch (e) {}
+        try { t = String(Safari.documents[0].name() || ''); } catch (e) {}
+        return {u: u, t: t};
+      };
+      // Root cause of the old stale-page race: assigning doc.url is
+      // asynchronous — the previous document (old URL/title, readyState
+      // 'complete') stays in place until WebKit commits the new navigation,
+      // so a bare readyState poll can "succeed" instantly against the OLD
+      // page. Snapshot the pre-navigation page first, then require the
+      // navigation to actually START before polling readyState.
+      const before = readDoc();
+      const sameTarget = norm(before.u) === norm(target);
+
+      Safari.documents[0].url = target;
+
+      const t0 = Date.now();
+      const NAV_START_MS = 5000;      // per set-url attempt
+      const SAME_URL_GRACE_MS = 1000; // same-URL reload never changes the URL
+      const TOTAL_MS = 20000;
+
+      // Phase 1: wait for navigation to start (URL or title moves away from
+      // the pre-navigation snapshot). If nothing happens within 5s, re-set
+      // doc.url once; if it still doesn't start, error out rather than
+      // return the stale page.
+      //
+      // Same-URL edge case (target == already-loaded URL): the URL never
+      // "changes", so after a short grace we treat navigation as started and
+      // accept the current/re-requested page. Chosen over forcing
+      // location.reload(): assigning doc.url already asks Safari to load the
+      // target, and stacking an explicit reload on top risks a double load.
+      let attempts = 1;
+      while (true) {
+        const now = readDoc();
+        if (norm(now.u) !== norm(before.u) || now.t !== before.t) break;
+        const elapsed = Date.now() - t0;
+        if (sameTarget && elapsed >= SAME_URL_GRACE_MS) break;
+        if (elapsed >= NAV_START_MS * attempts) {
+          if (attempts === 1) {
+            attempts = 2;
+            Safari.documents[0].url = target;
+          } else {
+            return 'ERR: navigation to ' + target + ' did not start within '
+              + Math.round(elapsed / 1000) + 's (page still at "' + now.u
+              + '") — refusing to return the stale page. Safari may be'
+              + ' blocking or ignoring the load; try again.';
+          }
+        }
+        delay(0.1);
+      }
+
+      // Phase 2: navigation has started — now wait for the new page to
+      // finish loading.
       let state = 'unknown';
       let lastErr = '';
-      const t0 = Date.now();
-      while (Date.now() - t0 < 15000) {
+      while (Date.now() - t0 < TOTAL_MS) {
         try {
           state = String(Safari.doJavaScript('document.readyState', {in: Safari.documents[0]}));
         } catch (e) {
