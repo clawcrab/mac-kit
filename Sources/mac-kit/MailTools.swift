@@ -409,6 +409,18 @@ struct MailStore {
         return nil
     }
 
+    /// Gmail-style accounts keep every message in "[Gmail]/All Mail" and model
+    /// mailboxes as labels, so a plain move to All Mail does not remove the
+    /// INBOX label. We detect them by the presence of an "All Mail" mailbox
+    /// (the Gmail signature) so mail_archive can take the label-removing path.
+    func isGmailAccount(uuid: String) -> Bool {
+        guard let rows = try? db.query(
+            "SELECT url FROM mailboxes WHERE url LIKE ?", [.text("%://\(uuid)/%")]
+        ) else { return false }
+        let names = rows.compactMap { $0.first?.stringValue }.map { Self.mailboxName(fromURL: $0).lowercased() }
+        return names.contains("all mail")
+    }
+
     // MARK: .emlx location
     //
     // Layout on disk (verified empirically on macOS 26 / Mail V10):
@@ -839,12 +851,32 @@ func mailSendText(to: String, subject: String, body: String,
 
 // MARK: mail_archive — move messages OUT of the INBOX (reversible, never delete)
 //
-// "Archive" means the same thing Mail.app's Archive button does: move the
-// message from the INBOX to the account's archive mailbox. For standard IMAP
-// (iCloud, custom domains) that is the "Archive" mailbox; for Gmail-style
-// accounts it is "All Mail", and the move simply removes the INBOX label while
-// the message stays in All Mail (verified empirically). Nothing is ever
-// deleted, so every archive is reversible from Mail.app.
+// "Archive" means the same thing Mail.app's Archive button does: take the
+// message out of the INBOX while keeping it filed and recoverable. How that is
+// done depends on the account type, and the two paths are NOT interchangeable:
+//
+//   • Standard IMAP (iCloud, custom domains): move the message from INBOX to
+//     the account's "Archive" mailbox. A real IMAP move; works directly.
+//
+//   • Gmail-style (Google/Gmail): archiving means removing the "INBOX" *label*
+//     while the message stays in "[Gmail]/All Mail". The obvious `move` from
+//     INBOX to All Mail is a NO-OP on Google's servers — every Gmail message is
+//     already in All Mail, so Mail.app updates only its local model and the
+//     INBOX label is never removed; after the next sync the message reappears
+//     in the inbox (verified empirically: move-to-All-Mail bounces back).
+//     What DOES remove the INBOX label is forcing Mail.app to issue real IMAP
+//     moves between mailboxes that don't already hold the message: delete the
+//     INBOX copy (Mail routes it to Trash — this drops the INBOX label on the
+//     server) and immediately move it from Trash into All Mail (this drops the
+//     Trash label, leaving the message archived in All Mail with no INBOX and
+//     no Trash label). Both hops are real server operations, so the archive
+//     sticks. Nothing is ever deleted — the message ends up in All Mail and is
+//     fully recoverable. (Gmail categories / Important / Starred labels may be
+//     dropped by the round-trip; that is acceptable for an inbox-archive tool.)
+//
+// After acting, the tool re-reads the message's mailbox membership and reports
+// the resulting state, so a move that failed to leave the INBOX is surfaced as
+// an ERROR rather than a bare "OK".
 //
 // Messages are addressed by ROWID (what mail_search / mail_unread return),
 // resolved to their RFC Message-ID and matched in Mail.app via `whose
@@ -855,7 +887,7 @@ func mailArchiveText(ids: [Int64]) throws -> String {
     guard !ids.isEmpty else { throw ToolError("mail_archive requires at least one id") }
     let store = try MailStore()
 
-    struct Job { let id: Int64; let mid: String; let account: String; let target: String }
+    struct Job { let id: Int64; let mid: String; let account: String; let target: String; let gmail: Bool }
     struct Outcome { let id: Int64; let ok: Bool; let message: String }
 
     var jobs: [Job] = []
@@ -879,14 +911,22 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                     message: "no Archive or All Mail mailbox for account \(account.name) — refusing to guess")
                 continue
             }
-            jobs.append(Job(id: id, mid: mid, account: account.name, target: target))
+            // Gmail-style accounts expose no "Archive" mailbox — archiveTargetName
+            // falls back to "All Mail" for them. That is our branch signal: a
+            // plain move to All Mail is a server-side no-op, so those go through
+            // the delete-then-refile path below.
+            let gmail = store.isGmailAccount(uuid: host)
+            jobs.append(Job(id: id, mid: mid, account: account.name, target: target, gmail: gmail))
         } catch {
             results[id] = Outcome(id: id, ok: false, message: "\(error)")
         }
     }
 
     if !jobs.isEmpty {
-        let payload = jobs.map { ["id": String($0.id), "mid": $0.mid, "account": $0.account, "target": $0.target] }
+        let payload = jobs.map {
+            ["id": String($0.id), "mid": $0.mid, "account": $0.account,
+             "target": $0.target, "gmail": $0.gmail ? "1" : "0"]
+        }
         let json = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
         let source = """
         function run() {
@@ -899,23 +939,70 @@ func mailArchiveText(ids: [Int64]) throws -> String {
             }
             return null;
           }
+          function acctByName(name) {
+            const accts = Mail.accounts;
+            for (let i = 0; i < accts.length; i++) {
+              try { if (String(accts[i].name()) === name) return accts[i]; } catch (e) {}
+            }
+            return null;
+          }
+          function hits(mbx, mid) {
+            if (!mbx) return -1;
+            try { return mbx.messages.whose({messageId: mid}).length; } catch (e) { return -1; }
+          }
           const out = [];
           for (const job of jobs) {
             try {
-              const acct = Mail.accounts.byName(job.account);
+              const acct = acctByName(job.account);
+              if (!acct) { out.push(job.id + '\\tERR\\tno account named "' + job.account + '"'); continue; }
               const inbox = mbxByName(acct, 'INBOX');
-              const dest = mbxByName(acct, job.target);
-              if (!dest) { out.push(job.id + '\\tERR\\tcannot resolve "' + job.target + '" mailbox'); continue; }
               if (!inbox) { out.push(job.id + '\\tERR\\tno INBOX mailbox on account'); continue; }
-              const found = inbox.messages.whose({messageId: job.mid});
-              if (found.length === 0) {
-                const already = dest.messages.whose({messageId: job.mid});
-                if (already.length > 0) { out.push(job.id + '\\tOK\\talready archived (in ' + job.target + ')'); }
-                else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
-                continue;
+
+              if (job.gmail === '1') {
+                // Gmail: remove the INBOX label via delete (-> Trash) then refile
+                // Trash -> All Mail. Both are real IMAP moves that stick.
+                const allmail = mbxByName(acct, 'All Mail');
+                const trash = mbxByName(acct, 'Trash');
+                if (!allmail) { out.push(job.id + '\\tERR\\tno All Mail mailbox on Gmail account'); continue; }
+                if (!trash) { out.push(job.id + '\\tERR\\tno Trash mailbox on Gmail account'); continue; }
+                const inInbox = inbox.messages.whose({messageId: job.mid});
+                if (inInbox.length === 0) {
+                  if (hits(allmail, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (not in INBOX; in All Mail)'); }
+                  else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
+                  continue;
+                }
+                Mail.delete(inInbox[0]);                 // drops INBOX label, lands in Trash
+                const inTrash = trash.messages.whose({messageId: job.mid});
+                if (inTrash.length === 0) {
+                  out.push(job.id + '\\tERR\\tremoved from INBOX but not found in Trash to refile — left out of INBOX (recover from Gmail Trash)');
+                  continue;
+                }
+                Mail.move(inTrash[0], {to: allmail});    // drops Trash label -> archived in All Mail
+                const inb = hits(inbox, job.mid), am = hits(allmail, job.mid), tr = hits(trash, job.mid);
+                if (inb === 0 && am > 0 && tr === 0) {
+                  out.push(job.id + '\\tOK\\tarchived (INBOX label removed; in All Mail)');
+                } else if (inb > 0) {
+                  out.push(job.id + '\\tERR\\tstill in INBOX after archive (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
+                } else if (tr > 0) {
+                  out.push(job.id + '\\tERR\\tleft in Trash, not refiled to All Mail (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
+                } else {
+                  out.push(job.id + '\\tOK\\tremoved from INBOX (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
+                }
+              } else {
+                // Standard IMAP: a real move INBOX -> Archive.
+                const dest = mbxByName(acct, job.target);
+                if (!dest) { out.push(job.id + '\\tERR\\tcannot resolve "' + job.target + '" mailbox'); continue; }
+                const found = inbox.messages.whose({messageId: job.mid});
+                if (found.length === 0) {
+                  if (hits(dest, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (in ' + job.target + ')'); }
+                  else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
+                  continue;
+                }
+                Mail.move(found[0], {to: dest});
+                const inb = hits(inbox, job.mid);
+                if (inb === 0) { out.push(job.id + '\\tOK\\tmoved to ' + job.target); }
+                else { out.push(job.id + '\\tERR\\tstill in INBOX after move to ' + job.target + ' (inbox=' + inb + ')'); }
               }
-              Mail.move(found[0], {to: dest});
-              out.push(job.id + '\\tOK\\tmoved to ' + job.target);
             } catch (e) {
               out.push(job.id + '\\tERR\\t' + e);
             }
