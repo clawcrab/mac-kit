@@ -113,6 +113,7 @@ Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes fourteen tools:
 | `mail_search` | `query` (required), `account`, `mailbox`, `since`, `limit` (default 20) | Matching messages in the same shape, with ids for `mail_read` |
 | `mail_read` | `id` (required) | Headers (from/to/cc/date/subject/mailbox) + text body (~6000 chars) |
 | `mail_send` | `to`, `subject`, `body` (required), `from_account`, `cc`, `bcc` | Send confirmation (sends immediately via Mail.app) |
+| `mail_archive` | `id` or `ids[]` (from `mail_search`/`mail_unread`) | Moves messages out of the inbox to the archive (Archive mailbox for IMAP; "All Mail" for Gmail). Reversible — never deletes. Returns per-id success/failure |
 
 ### Wiring into an MCP client
 

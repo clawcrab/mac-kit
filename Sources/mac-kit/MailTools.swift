@@ -372,6 +372,43 @@ struct MailStore {
         return "\(name) <\(address)>"
     }
 
+    // MARK: ROWID -> RFC Message-ID bridge
+    //
+    // Mail's AppleScript object model has no key we can match to a ROWID, but
+    // it does expose each message's RFC 5322 Message-ID via the `message id`
+    // property. The Envelope Index stores that header in
+    // message_global_data.message_id_header, keyed by the integer message hash
+    // (messages.message_id -> message_global_data.message_id). So: ROWID ->
+    // messages.message_id -> message_id_header, strip the angle brackets, then
+    // in JXA find the message `whose messageId is <that>`.
+
+    func messageIDHeader(id: Int64) throws -> String? {
+        let sql = """
+        SELECT g.message_id_header
+        FROM messages m
+        JOIN message_global_data g ON g.message_id = m.message_id
+        WHERE m.ROWID = ? LIMIT 1
+        """
+        let raw = try db.query(sql, [.int(id)]).first?.first?.stringValue
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: CharacterSet(charactersIn: "<> \t\r\n"))
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The mailbox a message should be archived into for its account:
+    /// "Archive" for standard IMAP (iCloud, custom domains), "All Mail" for
+    /// Gmail-style accounts (moving there drops the INBOX label). Nil when the
+    /// account exposes neither — the caller must not guess.
+    func archiveTargetName(forAccountUUID uuid: String) -> String? {
+        guard let rows = try? db.query(
+            "SELECT url FROM mailboxes WHERE url LIKE ?", [.text("%://\(uuid)/%")]
+        ) else { return nil }
+        let names = rows.compactMap { $0.first?.stringValue }.map { Self.mailboxName(fromURL: $0) }
+        if names.contains(where: { $0.lowercased() == "archive" }) { return "Archive" }
+        if names.contains(where: { $0.lowercased() == "all mail" }) { return "All Mail" }
+        return nil
+    }
+
     // MARK: .emlx location
     //
     // Layout on disk (verified empirically on macOS 26 / Mail V10):
@@ -798,4 +835,112 @@ func mailSendText(to: String, subject: String, body: String,
     let result = try runJXA(source, timeout: 30)
     if result.hasPrefix("ERR:") { throw ToolError(String(result.dropFirst(4)).trimmingCharacters(in: .whitespaces)) }
     return result
+}
+
+// MARK: mail_archive — move messages OUT of the INBOX (reversible, never delete)
+//
+// "Archive" means the same thing Mail.app's Archive button does: move the
+// message from the INBOX to the account's archive mailbox. For standard IMAP
+// (iCloud, custom domains) that is the "Archive" mailbox; for Gmail-style
+// accounts it is "All Mail", and the move simply removes the INBOX label while
+// the message stays in All Mail (verified empirically). Nothing is ever
+// deleted, so every archive is reversible from Mail.app.
+//
+// Messages are addressed by ROWID (what mail_search / mail_unread return),
+// resolved to their RFC Message-ID and matched in Mail.app via `whose
+// messageId`. All lookups iterate account.mailboxes by name rather than using
+// `by name` specifiers, which return broken references for Gmail mailboxes.
+
+func mailArchiveText(ids: [Int64]) throws -> String {
+    guard !ids.isEmpty else { throw ToolError("mail_archive requires at least one id") }
+    let store = try MailStore()
+
+    struct Job { let id: Int64; let mid: String; let account: String; let target: String }
+    struct Outcome { let id: Int64; let ok: Bool; let message: String }
+
+    var jobs: [Job] = []
+    var results: [Int64: Outcome] = [:]
+
+    for id in ids {
+        do {
+            let detail = try store.messageDetail(id: id)
+            guard let host = URL(string: detail.row.mailboxURL)?.host,
+                  let account = store.accounts.first(where: { $0.uuid == host }) else {
+                results[id] = Outcome(id: id, ok: false, message: "cannot determine the account for this message")
+                continue
+            }
+            guard let mid = try store.messageIDHeader(id: id) else {
+                results[id] = Outcome(id: id, ok: false,
+                    message: "no Message-ID in the index yet (message not fully synced)")
+                continue
+            }
+            guard let target = store.archiveTargetName(forAccountUUID: host) else {
+                results[id] = Outcome(id: id, ok: false,
+                    message: "no Archive or All Mail mailbox for account \(account.name) — refusing to guess")
+                continue
+            }
+            jobs.append(Job(id: id, mid: mid, account: account.name, target: target))
+        } catch {
+            results[id] = Outcome(id: id, ok: false, message: "\(error)")
+        }
+    }
+
+    if !jobs.isEmpty {
+        let payload = jobs.map { ["id": String($0.id), "mid": $0.mid, "account": $0.account, "target": $0.target] }
+        let json = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
+        let source = """
+        function run() {
+          const Mail = Application('Mail');
+          const jobs = JSON.parse(\(jsLiteral(json)));
+          function mbxByName(account, wanted) {
+            const boxes = account.mailboxes;
+            for (let i = 0; i < boxes.length; i++) {
+              try { if (String(boxes[i].name()) === wanted) return boxes[i]; } catch (e) {}
+            }
+            return null;
+          }
+          const out = [];
+          for (const job of jobs) {
+            try {
+              const acct = Mail.accounts.byName(job.account);
+              const inbox = mbxByName(acct, 'INBOX');
+              const dest = mbxByName(acct, job.target);
+              if (!dest) { out.push(job.id + '\\tERR\\tcannot resolve "' + job.target + '" mailbox'); continue; }
+              if (!inbox) { out.push(job.id + '\\tERR\\tno INBOX mailbox on account'); continue; }
+              const found = inbox.messages.whose({messageId: job.mid});
+              if (found.length === 0) {
+                const already = dest.messages.whose({messageId: job.mid});
+                if (already.length > 0) { out.push(job.id + '\\tOK\\talready archived (in ' + job.target + ')'); }
+                else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
+                continue;
+              }
+              Mail.move(found[0], {to: dest});
+              out.push(job.id + '\\tOK\\tmoved to ' + job.target);
+            } catch (e) {
+              out.push(job.id + '\\tERR\\t' + e);
+            }
+          }
+          return out.join('\\n');
+        }
+        """
+        let raw = try runJXA(source, timeout: 90)
+        for line in raw.split(separator: "\n") {
+            let parts = line.components(separatedBy: "\t")
+            guard parts.count >= 3, let rid = Int64(parts[0]) else { continue }
+            results[rid] = Outcome(id: rid, ok: parts[1] == "OK",
+                                   message: parts[2...].joined(separator: "\t"))
+        }
+        // Any job with no line back is a failure we shouldn't silently drop.
+        for job in jobs where results[job.id] == nil {
+            results[job.id] = Outcome(id: job.id, ok: false, message: "no result returned from Mail.app")
+        }
+    }
+
+    let ordered = ids.map { results[$0] ?? Outcome(id: $0, ok: false, message: "no result") }
+    let okCount = ordered.filter { $0.ok }.count
+    var lines = ["Archived \(okCount) of \(ids.count) message(s):"]
+    for outcome in ordered {
+        lines.append("  [\(outcome.id)] \(outcome.ok ? "OK" : "ERROR") — \(outcome.message)")
+    }
+    return lines.joined(separator: "\n")
 }

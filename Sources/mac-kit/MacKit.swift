@@ -185,8 +185,22 @@ struct MailCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mail",
         abstract: "Read Apple Mail's local index (read-only) and send via Mail.app.",
-        subcommands: [MailUnread.self, MailSearch.self, MailRead.self, MailSend.self]
+        subcommands: [MailUnread.self, MailSearch.self, MailRead.self, MailSend.self, MailArchive.self]
     )
+}
+
+struct MailArchive: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "archive",
+        abstract: "Move message(s) out of the INBOX to the account's Archive/All Mail (reversible; never deletes)."
+    )
+
+    @Argument(help: "One or more message ids from mail search/unread, e.g. 40048 40057")
+    var ids: [Int64]
+
+    func run() throws {
+        print(try mailArchiveText(ids: ids))
+    }
 }
 
 struct MailUnread: ParsableCommand {
