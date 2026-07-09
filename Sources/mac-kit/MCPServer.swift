@@ -229,6 +229,88 @@ struct MCPServer {
             ]
         ],
         [
+            "name": "notes_list",
+            "description": "List Apple Notes — metadata only, never bodies: name, folder, modification date, hasAttachments flag, and id (for notes_read). Folder is null for shared notes (Notes refuses the container query on them). Optional case-insensitive substring filter on the note name; newest first.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "query": [
+                        "type": "string",
+                        "description": "Optional case-insensitive substring matched against note names"
+                    ],
+                    "limit": ["type": "integer", "description": "Max results (default 20)"]
+                ]
+            ]
+        ],
+        [
+            "name": "notes_read",
+            "description": "Read one Apple Note by exact name or by id (from notes_list). If several notes share the name, errors listing candidate ids — pass \"id\" instead. Returns the HTML body, a plaintext rendering, hasAttachments, and a revision (SHA-256 of the raw HTML body) that notes_append requires as expected_revision. Read-only.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Exact note name"],
+                    "id": ["type": "string", "description": "Note id from notes_list (disambiguates duplicate names)"]
+                ]
+            ]
+        ],
+        [
+            "name": "notes_append",
+            "description": "Append content to the END of an existing Apple Note. Compare-and-swap: expected_revision (from a fresh notes_read) must still match or nothing is written (REVISION_MISMATCH — re-read and retry). Refuses notes with attachments (HAS_ATTACHMENTS: a body write would destroy them; there is no force flag). The previous body is backed up to ~/.mac-kit/notes-backups/ before writing. Content may be an HTML fragment or plain text (plain text is entity-escaped and wrapped in <div>s). Returns the new revision. No delete verb exists; to modify existing text use notes_edit.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Exact note name (or pass \"id\")"],
+                    "id": ["type": "string", "description": "Note id from notes_list/notes_read"],
+                    "content": [
+                        "type": "string",
+                        "description": "HTML fragment or plain text to append"
+                    ],
+                    "expected_revision": [
+                        "type": "string",
+                        "description": "Revision hash from a fresh notes_read of this note (64-char hex)"
+                    ]
+                ],
+                "required": ["content", "expected_revision"]
+            ]
+        ],
+        [
+            "name": "notes_edit",
+            "description": "Edit an existing Apple Note by exact-string replacement, like a code editor's edit tool: old_string must occur EXACTLY ONCE in the note's raw HTML body (tags included — notes_read first and copy exact HTML context). Zero matches → NO_MATCH; several → AMBIGUOUS (provide more context); nothing is written in either case. Same rails as notes_append: compare-and-swap on expected_revision from a fresh notes_read (REVISION_MISMATCH if the note changed), refuses notes with attachments (HAS_ATTACHMENTS — a body write would destroy them; no force flag), and the previous body is backed up to ~/.mac-kit/notes-backups/ before writing. Returns the new revision.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "name": ["type": "string", "description": "Exact note name (or pass \"id\")"],
+                    "id": ["type": "string", "description": "Note id from notes_list/notes_read"],
+                    "old_string": [
+                        "type": "string",
+                        "description": "Exact substring of the current body HTML to replace — must occur exactly once"
+                    ],
+                    "new_string": [
+                        "type": "string",
+                        "description": "Replacement HTML/text (raw — inserted verbatim into the body HTML)"
+                    ],
+                    "expected_revision": [
+                        "type": "string",
+                        "description": "Revision hash from a fresh notes_read of this note (64-char hex)"
+                    ]
+                ],
+                "required": ["old_string", "new_string", "expected_revision"]
+            ]
+        ],
+        [
+            "name": "notes_create",
+            "description": "Create a new Apple Note with a title and content (HTML fragment or plain text — plain text is entity-escaped and wrapped in <div>s) in a folder (default \"Notes\"). Always safe: never touches existing notes. Returns the new note's name, id, and revision.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "title": ["type": "string", "description": "Note title (becomes the first line / display name)"],
+                    "content": ["type": "string", "description": "Note content: HTML fragment or plain text"],
+                    "folder": ["type": "string", "description": "Target folder name (default \"Notes\")"]
+                ],
+                "required": ["title", "content"]
+            ]
+        ],
+        [
             "name": "mail_archive",
             "description": "Move one or more messages OUT of the INBOX to the account's archive (Archive mailbox for standard IMAP; \"All Mail\" for Gmail, which just drops the INBOX label). Reversible — never deletes. Ids are the [id] values from mail_search/mail_unread. Returns per-id success/failure.",
             "inputSchema": [
@@ -390,6 +472,57 @@ struct MCPServer {
                     cc: args["cc"] as? String,
                     bcc: args["bcc"] as? String
                 )
+            case "notes_list":
+                let query = args["query"] as? String
+                let limit = (args["limit"] as? NSNumber)?.intValue ?? 20
+                text = try notesListText(query: query, limit: limit)
+            case "notes_read":
+                let noteName = args["name"] as? String
+                let noteId = args["id"] as? String
+                guard noteName?.isEmpty == false || noteId?.isEmpty == false else {
+                    throw ToolError("notes_read requires \"name\" or \"id\"")
+                }
+                text = try notesReadText(name: noteName, id: noteId)
+            case "notes_append":
+                let noteName = args["name"] as? String
+                let noteId = args["id"] as? String
+                guard noteName?.isEmpty == false || noteId?.isEmpty == false else {
+                    throw ToolError("notes_append requires \"name\" or \"id\"")
+                }
+                guard let content = args["content"] as? String, !content.isEmpty else {
+                    throw ToolError("notes_append requires \"content\"")
+                }
+                guard let expected = args["expected_revision"] as? String, !expected.isEmpty else {
+                    throw ToolError("notes_append requires \"expected_revision\" from a fresh notes_read (CAS guard)")
+                }
+                text = try notesAppendText(name: noteName, id: noteId,
+                                           content: content, expectedRevision: expected)
+            case "notes_edit":
+                let noteName = args["name"] as? String
+                let noteId = args["id"] as? String
+                guard noteName?.isEmpty == false || noteId?.isEmpty == false else {
+                    throw ToolError("notes_edit requires \"name\" or \"id\"")
+                }
+                guard let oldString = args["old_string"] as? String, !oldString.isEmpty else {
+                    throw ToolError("notes_edit requires \"old_string\"")
+                }
+                guard let newString = args["new_string"] as? String else {
+                    throw ToolError("notes_edit requires \"new_string\" (may be an empty string)")
+                }
+                guard let expected = args["expected_revision"] as? String, !expected.isEmpty else {
+                    throw ToolError("notes_edit requires \"expected_revision\" from a fresh notes_read (CAS guard)")
+                }
+                text = try notesEditText(name: noteName, id: noteId, oldString: oldString,
+                                         newString: newString, expectedRevision: expected)
+            case "notes_create":
+                guard let title = args["title"] as? String, !title.isEmpty else {
+                    throw ToolError("notes_create requires \"title\"")
+                }
+                guard let content = args["content"] as? String else {
+                    throw ToolError("notes_create requires \"content\" (may be an empty string)")
+                }
+                text = try notesCreateText(title: title, content: content,
+                                           folder: args["folder"] as? String)
             case "mail_archive":
                 var ids: [Int64] = []
                 if let single = (args["id"] as? NSNumber)?.int64Value { ids.append(single) }
