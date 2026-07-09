@@ -86,7 +86,32 @@ func notesHTMLFragment(from content: String) -> String {
 ///   - both sides' attributes must be byte-identical (backreference), so
 ///     <span style="A">…<span style="B"> never merges;
 ///   - fragment content may not itself contain the same tag, so only true
-///     sibling fragments match, never across intervening text.
+///     sibling fragments match, never across intervening text;
+///   - opening tags are parsed quote-aware, so a `>` inside a quoted
+///     attribute value cannot truncate the match and corrupt the rewrite;
+///   - a seam is refused when the left fragment ends mid-character-reference
+///     (trailing `&`-run with no `;`), so "&" + "nbsp;" can never fuse into
+///     a real &nbsp; across the join.
+/// True when `content` ends mid-character-reference: a trailing `&` run of
+/// entity-name characters with no terminating `;` (e.g. "&", "&nb", "&#160").
+/// A seam whose left fragment ends like this must NOT merge — joining
+/// `<b>&</b><b>nbsp;</b>` would fuse the literal text "&" + "nbsp;" into an
+/// actual &nbsp; character reference. A COMPLETE entity ("x&amp;") ends with
+/// `;` and is safe to merge.
+func notesEndsWithIncompleteEntity(_ content: String) -> Bool {
+    content.range(of: "&[A-Za-z0-9#]*$", options: .regularExpression) != nil
+}
+
+/// Quote-aware attribute-list pattern: values may be "double-quoted",
+/// 'single-quoted', or unquoted (no whitespace/>/quotes), so a `>` INSIDE a
+/// quoted value (title="a>b") can never terminate the tag match — a naive
+/// [^>]* would split the tag there and rewrite corrupted HTML. The unquoted
+/// branch deliberately EXCLUDES quote characters and requires 1+ chars:
+/// otherwise the regex could backtrack into parsing `"a` as an unquoted
+/// value and still put the in-quote `>` at the tag boundary.
+private let notesTagAttributesPattern =
+    "((?:\\s+[^\\s>\"'=]+(?:=(?:\"[^\"]*\"|'[^']*'|[^\\s>\"']+))?)*)"
+
 func notesMergeAdjacentFragments(_ html: String) -> String {
     let tags = ["h1", "h2", "h3", "b", "i", "u", "em", "strong", "span"]
     var current = html
@@ -94,9 +119,33 @@ func notesMergeAdjacentFragments(_ html: String) -> String {
         var next = current
         for tag in tags {
             // <tag ATTRS>CONTENT</tag><tag ATTRS>  ->  <tag ATTRS>CONTENT…
-            let pattern = "(?s)<\(tag)((?:\\s[^>]*)?)>((?:(?!</?\(tag)[\\s>]).)*?)</\(tag)><\(tag)\\1>"
-            next = next.replacingOccurrences(of: pattern, with: "<\(tag)$1>$2",
-                                             options: .regularExpression)
+            // group 1 = attrs (must be byte-identical on both sides, \1),
+            // group 2 = content (may not contain the same tag).
+            let pattern = "(?s)<\(tag)\(notesTagAttributesPattern)\\s*>"
+                + "((?:(?!</?\(tag)[\\s>]).)*?)</\(tag)><\(tag)\\1\\s*>"
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let ns = next as NSString
+            let matches = regex.matches(in: next, range: NSRange(location: 0, length: ns.length))
+            if matches.isEmpty { continue }
+            var out = ""
+            var cursor = 0
+            for match in matches {
+                out += ns.substring(with: NSRange(location: cursor,
+                                                  length: match.range.location - cursor))
+                let attrs = ns.substring(with: match.range(at: 1))
+                let content = ns.substring(with: match.range(at: 2))
+                if notesEndsWithIncompleteEntity(content) {
+                    // Refuse just this seam (would fuse a character
+                    // reference across the join); emit it untouched and let
+                    // the fixpoint loop keep working elsewhere.
+                    out += ns.substring(with: match.range)
+                } else {
+                    out += "<\(tag)\(attrs)>\(content)"
+                }
+                cursor = match.range.location + match.range.length
+            }
+            out += ns.substring(from: cursor)
+            next = out
         }
         if next == current { return next }
         current = next

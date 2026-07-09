@@ -98,6 +98,28 @@ struct SelfTestCommand: ParsableCommand {
         let sample = "<div><b><h1>🗺️</h1></b><b><h1> 15</h1></b></div><div><b>x</b><b>y</b></div>"
         t.equal(notesMergeAdjacentFragments(notesMergeAdjacentFragments(sample)),
                 notesMergeAdjacentFragments(sample), "merge: idempotent")
+        t.equal(notesMergeAdjacentFragments(
+                    "<span title=\"a>b\">X</span><span title=\"a>b\">Y</span>"),
+                "<span title=\"a>b\">XY</span>",
+                "merge: quoted > inside attr parsed correctly, merges cleanly")
+        let quotedDiffer = "<span title=\"a>b\">X</span><span title=\"a>c\">Y</span>"
+        t.equal(notesMergeAdjacentFragments(quotedDiffer), quotedDiffer,
+                "merge: quoted > attrs that differ are not merged, not corrupted")
+        let entityFusion = "<b>&</b><b>nbsp;</b>"
+        t.equal(notesMergeAdjacentFragments(entityFusion), entityFusion,
+                "merge: refuses seam that would fuse & + nbsp; into an entity")
+        let entitySplit = "<b>x&am</b><b>p;y</b>"
+        t.equal(notesMergeAdjacentFragments(entitySplit), entitySplit,
+                "merge: refuses seam ending in partial entity name")
+        t.equal(notesMergeAdjacentFragments("<b>x&amp;</b><b>y</b>"),
+                "<b>x&amp;y</b>",
+                "merge: COMPLETE entity (&amp; ends with ;) still merges")
+        t.check(notesEndsWithIncompleteEntity("&"), "entity guard: bare &")
+        t.check(notesEndsWithIncompleteEntity("x&nb"), "entity guard: partial name")
+        t.check(notesEndsWithIncompleteEntity("x&#160"), "entity guard: partial numeric")
+        t.check(!notesEndsWithIncompleteEntity("x&amp;"), "entity guard: complete entity ok")
+        t.check(!notesEndsWithIncompleteEntity("plain"), "entity guard: plain text ok")
+        t.check(!notesEndsWithIncompleteEntity(""), "entity guard: empty ok")
 
         // MARK: Backup filename sanitization
 
