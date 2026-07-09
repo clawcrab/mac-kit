@@ -296,8 +296,8 @@ struct MailSend: ParsableCommand {
 struct NotesCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "notes",
-        abstract: "Apple Notes via AppleScript: list/read (read-only), append/edit (CAS-guarded, backed up), create.",
-        subcommands: [NotesList.self, NotesRead.self, NotesAppend.self, NotesEdit.self, NotesCreate.self]
+        abstract: "Apple Notes via AppleScript: list/read (read-only), append/edit (CAS-guarded, backed up), create, restore (CLI-only).",
+        subcommands: [NotesList.self, NotesRead.self, NotesAppend.self, NotesEdit.self, NotesCreate.self, NotesRestore.self]
     )
 }
 
@@ -392,6 +392,29 @@ struct NotesEdit: ParsableCommand {
         }
         print(try notesEditText(name: name, id: id, oldString: oldString,
                                 newString: newString, expectedRevision: expectedRevision))
+    }
+}
+
+struct NotesRestore: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "restore",
+        abstract: "Restore a note's body from a ~/.mac-kit/notes-backups/ file (CLI-only full-body replace; deliberately NOT exposed over MCP). Backs up the current body first; restored HTML passes through the fragment merge."
+    )
+
+    @Argument(help: "Path to the backup .html file")
+    var file: String
+
+    @Option(name: .customLong("to"), help: "Exact name of the note to restore into")
+    var name: String?
+
+    @Option(help: "Note id (disambiguates duplicate names)")
+    var id: String?
+
+    func run() throws {
+        guard name?.isEmpty == false || id?.isEmpty == false else {
+            throw ToolError("notes restore requires --to <note name> or --id")
+        }
+        print(try notesRestoreText(name: name, id: id, fromFile: file))
     }
 }
 

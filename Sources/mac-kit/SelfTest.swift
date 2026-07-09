@@ -64,6 +64,41 @@ struct SelfTestCommand: ParsableCommand {
         let html = "<div>already <b>html</b> &amp; entities</div>"
         t.equal(notesHTMLFragment(from: html), html, "fragment passes HTML through")
 
+        // MARK: Fragment merging (Notes shatters headings/styled runs)
+
+        t.equal(notesMergeAdjacentFragments("<b><h1>A</h1></b><b><h1>B</h1></b>"),
+                "<b><h1>AB</h1></b>", "merge: the canonical shattered-h1 case")
+        t.equal(notesMergeAdjacentFragments("<b><h2>西北雨林</h2></b><b><h2> + </h2></b><b><h2>黄石秋色</h2></b>"),
+                "<b><h2>西北雨林 + 黄石秋色</h2></b>", "merge: h2 fragments with CJK")
+        t.equal(notesMergeAdjacentFragments("<b><h1>A</h1></b><b><h1>B</h1></b><b><h1>C</h1></b>"),
+                "<b><h1>ABC</h1></b>", "merge: triple fragments reach fixpoint")
+        t.equal(notesMergeAdjacentFragments(
+                    "<div><b><h1>🗺️</h1></b><b><h1> 15</h1></b><b><h1>天环美硬核路书</h1></b></div>"),
+                "<div><b><h1>🗺️ 15天环美硬核路书</h1></b></div>",
+                "merge: real damaged-note heading line")
+        t.equal(notesMergeAdjacentFragments("<b>America the Beautiful </b><b>国家公园年票（</b><b>$80</b><b>）</b>"),
+                "<b>America the Beautiful 国家公园年票（$80）</b>", "merge: plain bold runs")
+        t.equal(notesMergeAdjacentFragments(
+                    "<span style=\"font-size: 24px\">A</span><span style=\"font-size: 24px\">B</span>"),
+                "<span style=\"font-size: 24px\">AB</span>", "merge: identical-style spans")
+        let differentSpans = "<span style=\"color: red\">A</span><span style=\"color: blue\">B</span>"
+        t.equal(notesMergeAdjacentFragments(differentSpans), differentSpans,
+                "merge: NON-identical span styles are not merged")
+        let intervening = "<b>A</b>x<b>B</b>"
+        t.equal(notesMergeAdjacentFragments(intervening), intervening,
+                "merge: intervening text blocks the seam")
+        let divs = "<div>a</div><div>b</div>"
+        t.equal(notesMergeAdjacentFragments(divs), divs,
+                "merge: adjacent divs are real lines, never merged")
+        let spaced = "<b>A</b> <b>B</b>"
+        t.equal(notesMergeAdjacentFragments(spaced), spaced,
+                "merge: whitespace at the seam is significant, not merged")
+        t.equal(notesMergeAdjacentFragments("plain text, no tags"), "plain text, no tags",
+                "merge: plain text untouched")
+        let sample = "<div><b><h1>🗺️</h1></b><b><h1> 15</h1></b></div><div><b>x</b><b>y</b></div>"
+        t.equal(notesMergeAdjacentFragments(notesMergeAdjacentFragments(sample)),
+                notesMergeAdjacentFragments(sample), "merge: idempotent")
+
         // MARK: Backup filename sanitization
 
         t.equal(notesBackupStem("Claw Shared note"), "Claw_Shared_note", "backup stem spaces")

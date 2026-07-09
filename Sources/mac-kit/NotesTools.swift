@@ -66,6 +66,43 @@ func notesHTMLFragment(from content: String) -> String {
         .joined()
 }
 
+/// Notes exports headings and styled runs as CONSECUTIVE identical fragments
+/// (e.g. <b><h1>A</h1></b><b><h1>B</h1></b> for the single heading "AB").
+/// Reading copes, but writing such HTML back verbatim makes Notes render
+/// EACH fragment as its own block — headings shatter into one character per
+/// line (field bug: a real note was damaged this way). This merges seams
+/// where the SAME tag with byte-IDENTICAL attributes closes and immediately
+/// reopens, iterating to a fixpoint so triple+ fragments collapse fully.
+///
+/// Applied to the FINAL assembled body just before `note.body =` in
+/// append/edit/create — never at read/match time, so notes_read output and
+/// notes_edit old_string matching semantics are untouched.
+///
+/// Merge rules, deliberately narrow:
+///   - only tags in the list below (inline styling + headings); <div> is NOT
+///     merged — adjacent divs are real separate lines in Notes;
+///   - the seam must be exactly adjacent (`</t><t…>`, no whitespace between —
+///     whitespace between inline elements is significant);
+///   - both sides' attributes must be byte-identical (backreference), so
+///     <span style="A">…<span style="B"> never merges;
+///   - fragment content may not itself contain the same tag, so only true
+///     sibling fragments match, never across intervening text.
+func notesMergeAdjacentFragments(_ html: String) -> String {
+    let tags = ["h1", "h2", "h3", "b", "i", "u", "em", "strong", "span"]
+    var current = html
+    while true {
+        var next = current
+        for tag in tags {
+            // <tag ATTRS>CONTENT</tag><tag ATTRS>  ->  <tag ATTRS>CONTENT…
+            let pattern = "(?s)<\(tag)((?:\\s[^>]*)?)>((?:(?!</?\(tag)[\\s>]).)*?)</\(tag)><\(tag)\\1>"
+            next = next.replacingOccurrences(of: pattern, with: "<\(tag)$1>$2",
+                                             options: .regularExpression)
+        }
+        if next == current { return next }
+        current = next
+    }
+}
+
 /// Filesystem-safe stem for a backup file: keep alphanumerics (any script)
 /// plus "-", "_", "."; everything else collapses to "_". Leading/trailing
 /// "_"/"." are trimmed (no hidden files), capped at 80 characters, never empty.
@@ -580,7 +617,13 @@ private func bestEffortNoteRead(noteId: String) -> (name: String?, body: String?
 
 func notesAppendText(name: String?, id: String?, content: String, expectedRevision: String) throws -> String {
     let snapshot = try snapshotForMutation(name: name, id: id, expectedRevision: expectedRevision)
-    let newBody = snapshot.body + "<div><br></div>" + notesHTMLFragment(from: content)
+    // Merge Notes' shattered heading/style fragments in the FINAL assembled
+    // body right before write-back — writing them verbatim makes Notes render
+    // each fragment as its own line. (The CAS compare below still uses the
+    // raw, unmerged snapshot body.)
+    let newBody = notesMergeAdjacentFragments(
+        snapshot.body + "<div><br></div>" + notesHTMLFragment(from: content)
+    )
     let backupPath = try writeNoteBackup(of: snapshot, verb: "append")
     try casMutateBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
     // The mutation is committed; this second execution is purely best-effort.
@@ -605,14 +648,46 @@ func notesEditText(name: String?, id: String?, oldString: String, newString: Str
     // Rail 2: old_string must occur exactly once in the raw HTML body
     // (NO_MATCH / AMBIGUOUS otherwise — checked before anything is written,
     // including the backup).
-    let newBody = try notesApplyUniqueEdit(body: snapshot.body,
-                                           oldString: oldString, newString: newString)
+    let editedBody = try notesApplyUniqueEdit(body: snapshot.body,
+                                              oldString: oldString, newString: newString)
+    // old_string matching ran against the RAW body (what notes_read shows);
+    // fragment-merging happens only now, on the final body about to be
+    // written, so callers who copied exact HTML context are unaffected.
+    let newBody = notesMergeAdjacentFragments(editedBody)
     let backupPath = try writeNoteBackup(of: snapshot, verb: "edit")
     try casMutateBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
     // The mutation is committed; this second execution is purely best-effort.
     let post = bestEffortNoteRead(noteId: snapshot.id)
     return notesMutationResultText(
         headline: "Edited \"\(post.name ?? snapshot.name)\" (1 replacement).",
+        oldRevision: snapshot.revision, newBody: post.body, backupPath: backupPath
+    )
+}
+
+// MARK: - notes restore (CLI only — deliberately NOT an MCP tool)
+
+/// Full-body restore from a ~/.mac-kit/notes-backups/ file. This is the one
+/// body-replacing verb, and it exists ONLY as a human-invoked CLI subcommand:
+/// the MCP surface keeps its no-replace guarantee. The current body is backed
+/// up first, the restored HTML goes through the fragment merge (so restoring
+/// a pre-merge backup cannot re-shatter headings), and the write uses the
+/// same CAS path as append/edit.
+func notesRestoreText(name: String?, id: String?, fromFile filePath: String) throws -> String {
+    let expanded = (filePath as NSString).expandingTildeInPath
+    guard let data = FileManager.default.contents(atPath: expanded) else {
+        throw ToolError("Cannot read backup file \(expanded)")
+    }
+    let restoredHTML = String(decoding: data, as: UTF8.self)
+    guard !restoredHTML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw ToolError("Backup file \(expanded) is empty — refusing to blank the note")
+    }
+    let snapshot = try readNoteSnapshot(name: name, id: id)
+    let backupPath = try writeNoteBackup(of: snapshot, verb: "restore")
+    let newBody = notesMergeAdjacentFragments(restoredHTML)
+    try casMutateBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
+    let post = bestEffortNoteRead(noteId: snapshot.id)
+    return notesMutationResultText(
+        headline: "Restored \"\(post.name ?? snapshot.name)\" from \(expanded).",
         oldRevision: snapshot.revision, newBody: post.body, backupPath: backupPath
     )
 }
@@ -627,6 +702,7 @@ func notesCreateText(title: String, content: String, folder: String?) throws -> 
     if !content.isEmpty {
         html += notesHTMLFragment(from: content)
     }
+    html = notesMergeAdjacentFragments(html)
     let source = """
     function run() {
       const Notes = Application('Notes');
