@@ -103,8 +103,10 @@ Mutations are deliberately constrained by four rails (no delete verb, no force f
 
 1. **Revision CAS** — `notes_read` returns a `revision` (lowercase hex SHA-256 of the raw HTML body). `notes_append`/`notes_edit` require it back as `expected_revision` and refuse with `REVISION_MISMATCH` if the note changed since the read (the final compare happens inside a single osascript execution, right before the write).
 2. **Exact-match uniqueness** (`notes_edit`) — `old_string` must occur exactly once in the body HTML; `NO_MATCH`/`AMBIGUOUS` otherwise, nothing written.
-3. **Attachment refusal** — a body write silently destroys a note's attachments, so notes with attachments are refused (`HAS_ATTACHMENTS`).
-4. **Auto-backup** — the previous body is saved to `~/.mac-kit/notes-backups/<name>-<unix-ts>.html` before every mutation; if the backup can't be written, the mutation doesn't happen.
+3. **Attachment refusal** — a body write silently destroys a note's attachments, so notes with attachments are refused (`HAS_ATTACHMENTS`). The check fails closed: if the attachment query itself errors, the write is refused too (`ATTACHMENT_CHECK_FAILED`).
+4. **Auto-backup** — the previous body is saved to `~/.mac-kit/notes-backups/<name>-<unix-ms>-<nonce>.html` before every mutation (refuse-to-overwrite; collisions get a numeric suffix); if the backup can't be written, the mutation doesn't happen.
+
+One asymmetry is deliberate: once a write has executed, the tool always reports success — if the post-write re-read fails you get `WRITE_OK_REVISION_UNKNOWN` (revision unknown; `notes_read` before the next mutation) instead of an error, because an error after a completed mutation would invite a retry and a duplicate write.
 
 ```sh
 mac-kit notes list Claw --limit 5                  # metadata only: name/folder/modified/attachments/id

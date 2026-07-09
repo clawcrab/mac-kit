@@ -76,8 +76,14 @@ struct SelfTestCommand: ParsableCommand {
         t.equal(notesBackupStem(""), "note", "backup stem empty input")
         t.check(notesBackupStem(String(repeating: "x", count: 300)).count <= 80,
                 "backup stem capped at 80")
-        t.equal(notesBackupFileName(noteName: "Claw Shared note", unixTime: 1_752_000_000),
-                "Claw_Shared_note-1752000000.html", "backup file name format")
+        t.equal(notesBackupFileName(noteName: "Claw Shared note", unixMillis: 1_752_000_000_123, nonce: "ab12"),
+                "Claw_Shared_note-1752000000123-ab12.html", "backup file name format (ms + nonce)")
+        t.equal(notesBackupFileName(noteName: "Claw Shared note", unixMillis: 1_752_000_000_123,
+                                    nonce: "ab12", attempt: 2),
+                "Claw_Shared_note-1752000000123-ab12-2.html", "backup file name collision suffix")
+        t.check(notesBackupFileName(noteName: "n", unixMillis: 1, nonce: "0000")
+                != notesBackupFileName(noteName: "n", unixMillis: 1, nonce: "0000", attempt: 1),
+                "backup collision retry changes the name")
 
         // MARK: notes_edit exact-string semantics
 
@@ -93,12 +99,43 @@ struct SelfTestCommand: ParsableCommand {
                                          oldString: "<div>x</div>", newString: "y")
         }
         t.throwsError(matching: { $0.contains("occurs 2 times") },
-                      "edit counts non-overlapping occurrences") {
+                      "edit counts OVERLAPPING occurrences (aaa contains aa twice)") {
+            _ = try notesApplyUniqueEdit(body: "aaa", oldString: "aa", newString: "b")
+        }
+        t.throwsError(matching: { $0.contains("occurs 3 times") },
+                      "edit overlapping count on aaaa/aa is 3") {
             _ = try notesApplyUniqueEdit(body: "aaaa", oldString: "aa", newString: "b")
         }
         t.equal(try? notesApplyUniqueEdit(body: "<div>keep drop</div>",
                                           oldString: " drop", newString: ""),
                 "<div>keep</div>", "edit with empty replacement deletes text")
+
+        // MARK: Attachment rail (fail CLOSED)
+
+        t.check(notesAttachmentRailError(count: 0) == nil, "attachment rail passes on verified zero")
+        t.check(notesAttachmentRailError(count: 2)?.hasPrefix("HAS_ATTACHMENTS") == true,
+                "attachment rail refuses on attachments present")
+        t.check(notesAttachmentRailError(count: -1)?.hasPrefix("ATTACHMENT_CHECK_FAILED") == true,
+                "attachment rail fails CLOSED when the check itself errored")
+        t.check(notesAttachmentRailError(count: -1) != notesAttachmentRailError(count: 2),
+                "attachment rail refusal codes are distinct")
+
+        // MARK: Post-write result shape (never error after a completed mutation)
+
+        let okResult = notesMutationResultText(headline: "Appended to \"n\".",
+                                               oldRevision: "aa", newBody: "<div>x</div>",
+                                               backupPath: "/tmp/b.html")
+        t.check(okResult.contains("New revision: \(sha256Hex("<div>x</div>"))"),
+                "mutation result carries new revision when re-read worked")
+        t.check(!okResult.contains("WRITE_OK_REVISION_UNKNOWN"),
+                "mutation result has no warning when re-read worked")
+        let degradedResult = notesMutationResultText(headline: "Appended to \"n\".",
+                                                     oldRevision: "aa", newBody: nil,
+                                                     backupPath: "/tmp/b.html")
+        t.check(degradedResult.hasPrefix("Appended to"),
+                "mutation result is still SUCCESS when post-write re-read failed")
+        t.check(degradedResult.contains("WRITE_OK_REVISION_UNKNOWN"),
+                "mutation result flags unknown revision after failed re-read")
 
         // MARK: JXA string-literal construction (injection safety)
         //
