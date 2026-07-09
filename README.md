@@ -116,6 +116,10 @@ mac-kit notes edit "Claw Shared note" --old "<div>foo</div>" --new "<div>bar</di
 mac-kit notes create "Title" --content "body text" --folder Notes
 ```
 
+Write-back normalization: Notes exports headings/styled runs as consecutive identical fragments (`<b><h1>A</h1></b><b><h1>B</h1></b>` for the heading "AB"); written back verbatim, each fragment renders as its own line and headings shatter. Every write path therefore merges exactly-adjacent, identically-attributed fragments (headings + inline styles only, never `<div>`) in the final body just before `set body` — read output and `notes_edit` matching are untouched.
+
+`mac-kit notes restore <backup.html> --to <name>` (CLI-only, deliberately not an MCP tool) restores a body from a backup file: backs up the current body first, applies the fragment merge, writes through the same CAS path.
+
 Content (`append`/`create`) may be an HTML fragment or plain text — plain text is entity-escaped and wrapped one `<div>` per line. `notes_edit` matches against the raw HTML body (tags included): `notes_read` first and copy exact HTML context. Folder is reported as null for shared notes (Notes raises -1700 on their `container` query).
 
 ## MCP server
