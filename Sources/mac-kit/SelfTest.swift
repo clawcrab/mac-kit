@@ -148,6 +148,30 @@ struct SelfTestCommand: ParsableCommand {
         t.check(notesTimeoutUnknownStateMessage(action: "create").contains("the create"),
                 "unknown-state message names the interrupted action")
 
+        // MARK: Failure-origin classification (dead process vs completed refusal)
+
+        t.check(notesMutationFailureMessage(
+                    for: NotesProcessDied("osascript timed out after 90s"), action: "write")
+                .hasPrefix("TIMEOUT_UNKNOWN_STATE"),
+                "dead mutation process maps to TIMEOUT_UNKNOWN_STATE")
+        t.check(notesMutationFailureMessage(
+                    for: NotesProcessDied("Unexpected response from Notes.app: garbage"), action: "write")
+                .hasPrefix("TIMEOUT_UNKNOWN_STATE"),
+                "unparseable mutation output maps to TIMEOUT_UNKNOWN_STATE")
+        t.equal(notesMutationFailureMessage(
+                    for: ToolError("cannot read note body: AppleEvent timed out"), action: "write"),
+                "cannot read note body: AppleEvent timed out",
+                "completed pre-write refusal containing 'timed out' stays precise")
+        t.equal(notesMutationFailureMessage(
+                    for: ToolError("cannot list Notes folders: timed out"), action: "create"),
+                "cannot list Notes folders: timed out",
+                "completed create refusal containing 'timed out' stays precise")
+        t.check(!notesMutationFailureMessage(
+                    for: ToolError("REVISION_MISMATCH: note changed since read; re-read and retry"),
+                    action: "write")
+                .contains("TIMEOUT_UNKNOWN_STATE"),
+                "structured CAS conflict never remapped to unknown state")
+
         // MARK: JXA string-literal construction (injection safety)
         //
         // Every dynamic value crossing into JXA source is embedded via

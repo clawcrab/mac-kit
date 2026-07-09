@@ -144,6 +144,19 @@ func notesTimeoutUnknownStateMessage(action: String) -> String {
         + " notes_list) to check the note's current state before retrying"
 }
 
+/// Classify a mutation-execution (EXECUTION 1) failure by ORIGIN:
+/// only a dead process (no structured output came back — NotesProcessDied)
+/// is the unknowable "may or may not have applied" case. Every other error —
+/// in particular structured pre-write {err} refusals from completed scripts,
+/// even ones whose text contains "timed out" — keeps its precise message,
+/// because those definitively did NOT mutate and are safe to retry.
+func notesMutationFailureMessage(for error: Error, action: String) -> String {
+    if error is NotesProcessDied {
+        return notesTimeoutUnknownStateMessage(action: action)
+    }
+    return "\(error)"
+}
+
 /// Result text for a COMPLETED append/edit. `newBody == nil` means the write
 /// succeeded but the post-write re-read failed — that must still be reported
 /// as success (an error here would invite a retry and a duplicate mutation);
@@ -168,13 +181,34 @@ func notesMutationResultText(headline: String, oldRevision: String,
 
 // MARK: - JXA plumbing
 
-/// Run a Notes JXA program that returns a JSON object string; parse it and
-/// surface `{err: "..."}` as a ToolError.
+/// Thrown when the osascript PROCESS died or produced no parseable JSON —
+/// i.e. the script did not complete with structured output (Swift-side
+/// timeout kill, crash, garbled stdout). Deliberately a distinct type from
+/// ToolError, which carries structured `{err}` refusals from scripts that
+/// DID complete: mutation callers classify failures by this ORIGIN, never by
+/// message substring — a completed pre-write refusal whose text happens to
+/// contain "timed out" (e.g. "cannot read note body: AppleEvent timed out")
+/// must stay a precise, safely-retryable error.
+struct NotesProcessDied: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
+    init(_ message: String) { self.message = message }
+}
+
+/// Run a Notes JXA program that returns a JSON object string.
+/// Failure taxonomy (load-bearing for the mutation paths):
+///   - process died / unparseable output  -> NotesProcessDied
+///   - completed script returned {err:...} -> ToolError (precise refusal)
 private func runNotesJSON(_ source: String, timeout: TimeInterval) throws -> [String: Any] {
-    let raw = try runJXA(source, timeout: timeout)
+    let raw: String
+    do {
+        raw = try runJXA(source, timeout: timeout)
+    } catch {
+        throw NotesProcessDied("\(error)")
+    }
     guard let data = raw.data(using: .utf8),
           let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-        throw ToolError("Unexpected response from Notes.app: \(String(raw.prefix(300)))")
+        throw NotesProcessDied("Unexpected response from Notes.app: \(String(raw.prefix(300)))")
     }
     if let err = object["err"] as? String { throw ToolError(err) }
     return object
@@ -500,9 +534,11 @@ private func casMutateBody(noteId: String, expectedBody: String, newBody: String
     let object: [String: Any]
     do {
         object = try runNotesJSON(source, timeout: 90)
-    } catch let error as ToolError
-        where error.message.contains("timed out") || error.message.hasPrefix("Unexpected response") {
-        throw ToolError(notesTimeoutUnknownStateMessage(action: "write"))
+    } catch {
+        // Classified by error ORIGIN: only a dead execution (NotesProcessDied)
+        // becomes TIMEOUT_UNKNOWN_STATE; structured pre-write refusals from
+        // completed scripts pass through with their precise message.
+        throw ToolError(notesMutationFailureMessage(for: error, action: "write"))
     }
     if object["conflict"] as? Bool == true {
         throw ToolError("REVISION_MISMATCH: note changed since read; re-read and retry")
@@ -624,9 +660,11 @@ func notesCreateText(title: String, content: String, folder: String?) throws -> 
     let object: [String: Any]
     do {
         object = try runNotesJSON(source, timeout: 60)
-    } catch let error as ToolError
-        where error.message.contains("timed out") || error.message.hasPrefix("Unexpected response") {
-        throw ToolError(notesTimeoutUnknownStateMessage(action: "create"))
+    } catch {
+        // Same origin-based classification as casMutateBody: only a dead
+        // execution is ambiguous; completed {err} refusals (e.g. folder not
+        // found, even "cannot list Notes folders: timed out") stay precise.
+        throw ToolError(notesMutationFailureMessage(for: error, action: "create"))
     }
     guard object["created"] as? Bool == true else {
         throw ToolError(notesTimeoutUnknownStateMessage(action: "create"))
