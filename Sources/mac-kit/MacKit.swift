@@ -9,7 +9,7 @@ struct MacKit: AsyncParsableCommand {
         version: MCPServer.serverVersion,
         subcommands: [
             Serve.self, Search.self, Geocode.self, Eta.self, SafariCommand.self,
-            Ocr.self, MailCommand.self
+            Ocr.self, MailCommand.self, NotesCommand.self, SelfTestCommand.self
         ]
     )
 }
@@ -288,6 +288,130 @@ struct MailSend: ParsableCommand {
     func run() throws {
         print(try mailSendText(to: to, subject: subject, body: body,
                                fromAccount: fromAccount, cc: cc, bcc: bcc))
+    }
+}
+
+// MARK: - Notes
+
+struct NotesCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "notes",
+        abstract: "Apple Notes via AppleScript: list/read (read-only), append/edit (CAS-guarded, backed up), create.",
+        subcommands: [NotesList.self, NotesRead.self, NotesAppend.self, NotesEdit.self, NotesCreate.self]
+    )
+}
+
+struct NotesList: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "list",
+        abstract: "List notes (metadata only): name, folder, modified, attachments, id."
+    )
+
+    @Argument(help: "Optional case-insensitive substring to match against note names")
+    var query: String?
+
+    @Option(help: "Max results")
+    var limit: Int = 20
+
+    func run() throws {
+        print(try notesListText(query: query, limit: limit))
+    }
+}
+
+struct NotesRead: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "read",
+        abstract: "Read one note (HTML body, plaintext, revision hash) by exact name or --id."
+    )
+
+    @Argument(help: "Exact note name")
+    var name: String?
+
+    @Option(help: "Note id from notes list (disambiguates duplicate names)")
+    var id: String?
+
+    func run() throws {
+        guard name?.isEmpty == false || id?.isEmpty == false else {
+            throw ToolError("notes read requires a name or --id")
+        }
+        print(try notesReadText(name: name, id: id))
+    }
+}
+
+struct NotesAppend: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "append",
+        abstract: "Append to the end of a note (CAS: requires the revision from a fresh read; refuses notes with attachments; backs up the old body)."
+    )
+
+    @Argument(help: "Exact note name")
+    var name: String?
+
+    @Option(help: "Note id from notes list (disambiguates duplicate names)")
+    var id: String?
+
+    @Option(help: "HTML fragment or plain text to append")
+    var content: String
+
+    @Option(name: .customLong("revision"), help: "expected_revision: the hash from a fresh notes read")
+    var expectedRevision: String
+
+    func run() throws {
+        guard name?.isEmpty == false || id?.isEmpty == false else {
+            throw ToolError("notes append requires a name or --id")
+        }
+        print(try notesAppendText(name: name, id: id, content: content,
+                                  expectedRevision: expectedRevision))
+    }
+}
+
+struct NotesEdit: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "edit",
+        abstract: "Exact-string edit of a note's body HTML (old string must occur exactly once; CAS revision; attachments refused; old body backed up)."
+    )
+
+    @Argument(help: "Exact note name")
+    var name: String?
+
+    @Option(help: "Note id from notes list (disambiguates duplicate names)")
+    var id: String?
+
+    @Option(name: .customLong("old"), help: "Exact substring of the current body HTML (must occur exactly once)")
+    var oldString: String
+
+    @Option(name: .customLong("new"), help: "Replacement text/HTML")
+    var newString: String
+
+    @Option(name: .customLong("revision"), help: "expected_revision: the hash from a fresh notes read")
+    var expectedRevision: String
+
+    func run() throws {
+        guard name?.isEmpty == false || id?.isEmpty == false else {
+            throw ToolError("notes edit requires a name or --id")
+        }
+        print(try notesEditText(name: name, id: id, oldString: oldString,
+                                newString: newString, expectedRevision: expectedRevision))
+    }
+}
+
+struct NotesCreate: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "create",
+        abstract: "Create a new note (always safe — never touches existing notes)."
+    )
+
+    @Argument(help: "Note title")
+    var title: String
+
+    @Option(help: "Note content: HTML fragment or plain text")
+    var content: String = ""
+
+    @Option(help: "Target folder name")
+    var folder: String = "Notes"
+
+    func run() throws {
+        print(try notesCreateText(title: title, content: content, folder: folder))
     }
 }
 

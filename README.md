@@ -1,6 +1,6 @@
 # mac-kit
 
-Native macOS system capabilities exposed as [MCP](https://modelcontextprotocol.io) tools: Apple Maps (MapKit / CoreLocation), Safari browser automation, on-device OCR (Vision framework), and Apple Mail (local index reads + sending via Mail.app). A single small executable that works both as an MCP stdio server and as a plain CLI for debugging.
+Native macOS system capabilities exposed as [MCP](https://modelcontextprotocol.io) tools: Apple Maps (MapKit / CoreLocation), Safari browser automation, on-device OCR (Vision framework), Apple Mail (local index reads + sending via Mail.app), and Apple Notes (guarded read/append/edit/create via Notes.app). A single small executable that works both as an MCP stdio server and as a plain CLI for debugging.
 
 No API keys, no location permission, no entitlements — all inputs are explicit strings, resolved through Apple's public MapKit/CLGeocoder/Vision APIs and Safari's AppleScript interface.
 
@@ -16,6 +16,12 @@ swift build -c release
 ```
 
 The binary lands at `.build/release/mac-kit`.
+
+```sh
+.build/release/mac-kit self-test
+```
+
+Runs the built-in unit checks for the pure helpers (hashing, HTML escaping, backup-path sanitization, edit semantics, JXA string construction). No app automation involved, CI-safe, exits nonzero on failure. (This lives in the binary because Command Line Tools-only toolchains ship neither XCTest nor swift-testing, so `swift test` can't link a test bundle.)
 
 ## CLI usage
 
@@ -89,13 +95,34 @@ Notes:
 - `read` prefers the `text/plain` MIME part and falls back to crudely tag-stripped HTML, truncated to ~6000 chars.
 - `send` sends immediately (no draft step). Pick the account with `--from` by account name or address; otherwise Mail's default account is used.
 
+## Apple Notes
+
+Notes.app has no public framework API, so everything goes through its AppleScript dictionary (JXA via `osascript`, program on stdin, all dynamic strings embedded as JSON literals — injection-safe by construction). The first use triggers a one-time macOS Automation permission prompt for Notes.
+
+Mutations are deliberately constrained by four rails (no delete verb, no force flags):
+
+1. **Revision CAS** — `notes_read` returns a `revision` (lowercase hex SHA-256 of the raw HTML body). `notes_append`/`notes_edit` require it back as `expected_revision` and refuse with `REVISION_MISMATCH` if the note changed since the read (the final compare happens inside a single osascript execution, right before the write).
+2. **Exact-match uniqueness** (`notes_edit`) — `old_string` must occur exactly once in the body HTML; `NO_MATCH`/`AMBIGUOUS` otherwise, nothing written.
+3. **Attachment refusal** — a body write silently destroys a note's attachments, so notes with attachments are refused (`HAS_ATTACHMENTS`).
+4. **Auto-backup** — the previous body is saved to `~/.mac-kit/notes-backups/<name>-<unix-ts>.html` before every mutation; if the backup can't be written, the mutation doesn't happen.
+
+```sh
+mac-kit notes list Claw --limit 5                  # metadata only: name/folder/modified/attachments/id
+mac-kit notes read "Claw Shared note"              # HTML body + plaintext + revision
+mac-kit notes append "Claw Shared note" --content "new line" --revision <hash>
+mac-kit notes edit "Claw Shared note" --old "<div>foo</div>" --new "<div>bar</div>" --revision <hash>
+mac-kit notes create "Title" --content "body text" --folder Notes
+```
+
+Content (`append`/`create`) may be an HTML fragment or plain text — plain text is entity-escaped and wrapped one `<div>` per line. `notes_edit` matches against the raw HTML body (tags included): `notes_read` first and copy exact HTML context. Folder is reported as null for shared notes (Notes raises -1700 on their `container` query).
+
 ## MCP server
 
 ```sh
 mac-kit serve
 ```
 
-Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes fourteen tools:
+Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes twenty tools:
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
@@ -114,6 +141,11 @@ Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes fourteen tools:
 | `mail_read` | `id` (required) | Headers (from/to/cc/date/subject/mailbox) + text body (~6000 chars) |
 | `mail_send` | `to`, `subject`, `body` (required), `from_account`, `cc`, `bcc` | Send confirmation (sends immediately via Mail.app) |
 | `mail_archive` | `id` or `ids[]` (from `mail_search`/`mail_unread`) | Takes messages out of the inbox. Standard IMAP (iCloud/custom domains): moves INBOX → Archive. Gmail: removes the INBOX label (a plain move to All Mail is a server-side no-op, so it deletes the INBOX copy then refiles it into All Mail — both real IMAP moves; the message ends up archived in All Mail). Re-checks mailbox membership after and reports the resulting state per id. Reversible — never deletes |
+| `notes_list` | `query`, `limit` (default 20) | Note metadata only (never bodies): name, folder (null for shared notes), modified, hasAttachments, id. Newest first |
+| `notes_read` | `name` or `id` | HTML body + plaintext + hasAttachments + `revision` (SHA-256 of body). Errors listing candidate ids if several notes share the name |
+| `notes_append` | `name`/`id`, `content`, `expected_revision` (required) | Appends to the end of the note under the CAS/attachment/backup rails; returns the new revision |
+| `notes_edit` | `name`/`id`, `old_string`, `new_string`, `expected_revision` (required) | Exact-string edit of the body HTML; `old_string` must occur exactly once (`NO_MATCH`/`AMBIGUOUS` otherwise). Same rails as append; returns the new revision |
+| `notes_create` | `title`, `content` (required), `folder` (default "Notes") | Creates a new note (never touches existing ones); returns name, id, revision |
 
 ### Wiring into an MCP client
 
