@@ -133,6 +133,17 @@ func notesAttachmentRailError(count: Int) -> String? {
     return nil
 }
 
+/// Message for the one irreducible ambiguity: the MUTATION osascript
+/// execution itself died from the outside (Swift-side timeout kill, or its
+/// output never arrived intact). There is no way to know whether the final
+/// write statement ran, so the caller must inspect the note before retrying —
+/// a blind retry could double-apply.
+func notesTimeoutUnknownStateMessage(action: String) -> String {
+    "TIMEOUT_UNKNOWN_STATE: the \(action) may or may not have applied —"
+        + " the mutation script did not report back; call notes_read (or"
+        + " notes_list) to check the note's current state before retrying"
+}
+
 /// Result text for a COMPLETED append/edit. `newBody == nil` means the write
 /// succeeded but the post-write re-read failed — that must still be reported
 /// as success (an error here would invite a retry and a duplicate mutation);
@@ -439,20 +450,28 @@ private func writeNoteBackup(of snapshot: NoteSnapshot, verb: String) throws -> 
     throw ToolError("Refusing to \(verb): could not find a free backup filename in \(backupDir.path)")
 }
 
-/// Compare-and-swap body write. The read + string-compare + write all happen
-/// inside ONE osascript execution, so the window between the Swift-side hash
-/// check and the actual write is closed by re-comparing the full body
-/// in-process (the new body was computed from exactly that expected body).
-/// Residual race: Notes' scripting interface has no atomic primitive, so a
-/// sync landing in the few ms between `note.body()` and `note.body = ...`
-/// below could still be lost. That window is as tight as the platform allows.
+/// EXECUTION 1 of a mutation: compare-and-swap body write, and NOTHING after
+/// the write. The read + string-compare + write all happen inside one
+/// osascript execution, so the window between the Swift-side hash check and
+/// the actual write is closed by re-comparing the full body in-process (the
+/// new body was computed from exactly that expected body). Residual race:
+/// Notes' scripting interface has no atomic primitive, so a sync landing in
+/// the few ms between `note.body()` and `note.body = ...` could still be
+/// lost. That window is as tight as the platform allows.
 ///
-/// Post-write contract: once `note.body = newBody` has executed, this
-/// function reports SUCCESS no matter what — a post-write re-read failure
-/// returns `(name, nil)` rather than throwing, because an error after a
-/// completed mutation would invite a retry and a duplicate write.
-private func casWriteBody(noteId: String, expectedBody: String,
-                          newBody: String) throws -> (name: String?, body: String?) {
+/// Post-write contract: the script returns a minimal `{written:true}`
+/// IMMEDIATELY after `note.body = newBody` — no post-write reads run in this
+/// execution, because JXA try/catch cannot catch a HUNG read; a hang here
+/// would trip runJXA's Swift-side timeout and convert a completed mutation
+/// into a tool error (duplicate-retry hazard). Post-write state is fetched by
+/// `bestEffortNoteRead` in a SEPARATE osascript execution.
+///
+/// If this execution itself dies without reporting back (timeout kill, or
+/// output never arrived), whether the write landed is unknowable from
+/// outside — that maps to TIMEOUT_UNKNOWN_STATE, telling the caller to
+/// inspect before retrying. Structured pre-write refusals ({err}, conflict,
+/// attachment counts) come from a completed execution and stay precise.
+private func casMutateBody(noteId: String, expectedBody: String, newBody: String) throws {
     let source = """
     function run() {
       const Notes = Application('Notes');
@@ -474,16 +493,17 @@ private func casWriteBody(noteId: String, expectedBody: String,
       try { attachmentCount = note.attachments.length; } catch (e) {}
       if (attachmentCount !== 0) return JSON.stringify({attachmentCount: attachmentCount});
       note.body = newBody;
-      // THE MUTATION IS DONE. From here on, never return err — best-effort
-      // re-reads only, so the caller always learns the write happened.
-      let readBack = null;
-      let readName = null;
-      try { readBack = String(note.body()); } catch (e) {}
-      try { readName = String(note.name()); } catch (e) {}
-      return JSON.stringify({ok: true, name: readName, body: readBack});
+      // THE MUTATION IS DONE — return immediately, nothing else may run.
+      return JSON.stringify({written: true});
     }
     """
-    let object = try runNotesJSON(source, timeout: 90)
+    let object: [String: Any]
+    do {
+        object = try runNotesJSON(source, timeout: 90)
+    } catch let error as ToolError
+        where error.message.contains("timed out") || error.message.hasPrefix("Unexpected response") {
+        throw ToolError(notesTimeoutUnknownStateMessage(action: "write"))
+    }
     if object["conflict"] as? Bool == true {
         throw ToolError("REVISION_MISMATCH: note changed since read; re-read and retry")
     }
@@ -491,9 +511,32 @@ private func casWriteBody(noteId: String, expectedBody: String,
        let railError = notesAttachmentRailError(count: count) {
         throw ToolError(railError)
     }
-    guard object["ok"] as? Bool == true else {
-        throw ToolError("Malformed response from Notes.app after write")
+    guard object["written"] as? Bool == true else {
+        // Completed execution, recognizable JSON, but neither a refusal nor
+        // the success marker — state unknown, same contract as a timeout.
+        throw ToolError(notesTimeoutUnknownStateMessage(action: "write"))
     }
+}
+
+/// EXECUTION 2: best-effort post-write read in its own osascript run,
+/// non-throwing AT THE SWIFT LAYER — any error, hang, or timeout here yields
+/// nils and the caller reports success with WRITE_OK_REVISION_UNKNOWN. A
+/// hung post-write read can no longer convert a completed mutation into a
+/// tool error. (The returned body is a fresh read, so the revision reflects
+/// the note's state now — including any sync that landed since the write.)
+private func bestEffortNoteRead(noteId: String) -> (name: String?, body: String?) {
+    let source = """
+    function run() {
+      const Notes = Application('Notes');
+      const note = Notes.notes.byId(\(jsLiteral(noteId)));
+      let name = null;
+      let body = null;
+      try { name = String(note.name()); } catch (e) {}
+      try { body = String(note.body()); } catch (e) {}
+      return JSON.stringify({ok: true, name: name, body: body});
+    }
+    """
+    guard let object = try? runNotesJSON(source, timeout: 30) else { return (nil, nil) }
     return (object["name"] as? String, object["body"] as? String)
 }
 
@@ -503,10 +546,12 @@ func notesAppendText(name: String?, id: String?, content: String, expectedRevisi
     let snapshot = try snapshotForMutation(name: name, id: id, expectedRevision: expectedRevision)
     let newBody = snapshot.body + "<div><br></div>" + notesHTMLFragment(from: content)
     let backupPath = try writeNoteBackup(of: snapshot, verb: "append")
-    let written = try casWriteBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
+    try casMutateBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
+    // The mutation is committed; this second execution is purely best-effort.
+    let post = bestEffortNoteRead(noteId: snapshot.id)
     return notesMutationResultText(
-        headline: "Appended to \"\(written.name ?? snapshot.name)\".",
-        oldRevision: snapshot.revision, newBody: written.body, backupPath: backupPath
+        headline: "Appended to \"\(post.name ?? snapshot.name)\".",
+        oldRevision: snapshot.revision, newBody: post.body, backupPath: backupPath
     )
 }
 
@@ -527,10 +572,12 @@ func notesEditText(name: String?, id: String?, oldString: String, newString: Str
     let newBody = try notesApplyUniqueEdit(body: snapshot.body,
                                            oldString: oldString, newString: newString)
     let backupPath = try writeNoteBackup(of: snapshot, verb: "edit")
-    let written = try casWriteBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
+    try casMutateBody(noteId: snapshot.id, expectedBody: snapshot.body, newBody: newBody)
+    // The mutation is committed; this second execution is purely best-effort.
+    let post = bestEffortNoteRead(noteId: snapshot.id)
     return notesMutationResultText(
-        headline: "Edited \"\(written.name ?? snapshot.name)\" (1 replacement).",
-        oldRevision: snapshot.revision, newBody: written.body, backupPath: backupPath
+        headline: "Edited \"\(post.name ?? snapshot.name)\" (1 replacement).",
+        oldRevision: snapshot.revision, newBody: post.body, backupPath: backupPath
     )
 }
 
@@ -563,31 +610,44 @@ func notesCreateText(title: String, content: String, folder: String?) throws -> 
       }
       const note = Notes.Note({body: html});
       folder.notes.push(note);
-      // THE NOTE EXISTS from here on — never return err after the push, or a
-      // retry would create a duplicate. Post-create reads are best-effort.
-      let body = null;
-      let name = null;
-      let id = null;
-      try { body = String(note.body()); } catch (e) {}
-      try { name = String(note.name()); } catch (e) {}
-      try { id = String(note.id()); } catch (e) {}
-      return JSON.stringify({ok: true, name: name, id: id, body: body});
+      // THE NOTE EXISTS — return immediately with a minimal marker. No
+      // post-create reads in this execution: JXA try/catch cannot catch a
+      // HUNG read, and a hang here would trip the Swift-side timeout and
+      // convert a completed create into a tool error (duplicate-retry
+      // hazard). Post-create state is fetched by a separate execution.
+      return JSON.stringify({created: true});
     }
     """
-    let object = try runNotesJSON(source, timeout: 60)
-    guard object["ok"] as? Bool == true else {
-        throw ToolError("Malformed response from Notes.app after create")
+    // EXECUTION 1: the create itself. If it dies without reporting back, the
+    // note may or may not exist — irreducible ambiguity, surfaced as
+    // TIMEOUT_UNKNOWN_STATE so the caller checks before retrying.
+    let object: [String: Any]
+    do {
+        object = try runNotesJSON(source, timeout: 60)
+    } catch let error as ToolError
+        where error.message.contains("timed out") || error.message.hasPrefix("Unexpected response") {
+        throw ToolError(notesTimeoutUnknownStateMessage(action: "create"))
     }
+    guard object["created"] as? Bool == true else {
+        throw ToolError(notesTimeoutUnknownStateMessage(action: "create"))
+    }
+
+    // EXECUTION 2: best-effort post-create read (separate osascript run) to
+    // recover the new note's id/body. Any failure here — including a match
+    // ambiguity if another note already shares the title — degrades to
+    // "created, details unknown", never to an error.
+    let post = try? readNoteSnapshot(name: title, id: nil)
     let revisionLine: String
-    if let body = object["body"] as? String {
-        revisionLine = "Revision: \(sha256Hex(body))"
+    if let post {
+        revisionLine = "Revision: \(post.revision)"
     } else {
         revisionLine = "Revision: unknown — WRITE_OK_REVISION_UNKNOWN: the note was created"
-            + " but the post-create re-read failed; call notes_read before mutating it"
+            + " but the post-create read failed or was ambiguous; call notes_read"
+            + " (or notes_list) before mutating it"
     }
     return """
-    Created note "\(object["name"] as? String ?? title)" in folder "\(folderName)".
-    Id: \(object["id"] as? String ?? "unknown — post-create re-read failed")
+    Created note "\(post?.name ?? title)" in folder "\(folderName)".
+    Id: \(post?.id ?? "unknown — post-create read failed")
     \(revisionLine)
     """
 }

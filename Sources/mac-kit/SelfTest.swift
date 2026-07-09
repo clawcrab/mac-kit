@@ -137,6 +137,17 @@ struct SelfTestCommand: ParsableCommand {
         t.check(degradedResult.contains("WRITE_OK_REVISION_UNKNOWN"),
                 "mutation result flags unknown revision after failed re-read")
 
+        // MARK: Mutation-execution death (unknowable write state)
+
+        let unknownState = notesTimeoutUnknownStateMessage(action: "write")
+        t.check(unknownState.hasPrefix("TIMEOUT_UNKNOWN_STATE"),
+                "unknown-state message carries the TIMEOUT_UNKNOWN_STATE code")
+        t.check(unknownState.contains("may or may not have applied")
+                && unknownState.contains("notes_read"),
+                "unknown-state message says to inspect before retrying")
+        t.check(notesTimeoutUnknownStateMessage(action: "create").contains("the create"),
+                "unknown-state message names the interrupted action")
+
         // MARK: JXA string-literal construction (injection safety)
         //
         // Every dynamic value crossing into JXA source is embedded via
