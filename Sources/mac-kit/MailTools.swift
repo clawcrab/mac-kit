@@ -972,19 +972,45 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                   continue;
                 }
                 Mail.delete(inInbox[0]);                 // drops INBOX label, lands in Trash
-                const inTrash = trash.messages.whose({messageId: job.mid});
-                if (inTrash.length === 0) {
-                  out.push(job.id + '\\tERR\\tremoved from INBOX but not found in Trash to refile — left out of INBOX (recover from Gmail Trash)');
-                  continue;
+                // Mail.delete() settles asynchronously: the message can take
+                // seconds to become visible in Trash (large messages / busy
+                // sync are slower). The old single-shot lookup here raced the
+                // move and stranded mail in Trash (2 real incidents, both
+                // image-heavy Starbucks sends). Poll instead of sampling once.
+                let trashMsg = null, reconciled = false;
+                for (let attempt = 0; attempt < 20; attempt++) {
+                  const t = trash.messages.whose({messageId: job.mid});
+                  if (t.length > 0) { trashMsg = t[0]; break; }
+                  delay(0.5);
                 }
-                Mail.move(inTrash[0], {to: allmail});    // drops Trash label -> archived in All Mail
+                // Only after the Trash poll budget expires may we conclude the
+                // label change reconciled straight to All Mail. Checking this
+                // INSIDE the poll loop would false-positive: Gmail mail always
+                // has an All Mail copy, so mid-flight (INBOX gone, Trash not
+                // yet visible) looks identical to reconciled-success.
+                if (trashMsg === null) {
+                  if (hits(allmail, job.mid) > 0 && hits(inbox, job.mid) === 0 && hits(trash, job.mid) === 0) {
+                    reconciled = true;
+                  } else {
+                    out.push(job.id + '\\tERR\\tdeleted from INBOX but not visible in Trash or All Mail after 10s — state unknown, check Gmail before retrying');
+                    continue;
+                  }
+                }
+                if (!reconciled) {
+                  Mail.move(trashMsg, {to: allmail});    // drops Trash label -> archived in All Mail
+                  // the refile settles asynchronously too — wait for it to stick
+                  for (let attempt = 0; attempt < 20; attempt++) {
+                    if (hits(trash, job.mid) === 0 && hits(allmail, job.mid) > 0) break;
+                    delay(0.5);
+                  }
+                }
                 const inb = hits(inbox, job.mid), am = hits(allmail, job.mid), tr = hits(trash, job.mid);
                 if (inb === 0 && am > 0 && tr === 0) {
                   out.push(job.id + '\\tOK\\tarchived (INBOX label removed; in All Mail)');
                 } else if (inb > 0) {
                   out.push(job.id + '\\tERR\\tstill in INBOX after archive (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
                 } else if (tr > 0) {
-                  out.push(job.id + '\\tERR\\tleft in Trash, not refiled to All Mail (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
+                  out.push(job.id + '\\tERR\\tleft in Trash, not refiled to All Mail — recover from Gmail Trash (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
                 } else {
                   out.push(job.id + '\\tOK\\tremoved from INBOX (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
                 }
@@ -1010,7 +1036,12 @@ func mailArchiveText(ids: [Int64]) throws -> String {
           return out.join('\\n');
         }
         """
-        let raw = try runJXA(source, timeout: 90)
+        // Gmail jobs can poll up to ~20s each (2 × 10s settle loops); a flat
+        // 90s cap would kill multi-message batches mid-flight and lose the
+        // per-id results of already-completed jobs. Scale with job count.
+        let gmailJobs = jobs.filter { $0.gmail }.count
+        let budget = max(90.0, Double(gmailJobs) * 25.0 + 15.0)
+        let raw = try runJXA(source, timeout: budget)
         for line in raw.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 3, let rid = Int64(parts[0]) else { continue }
