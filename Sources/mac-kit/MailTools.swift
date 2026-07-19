@@ -950,6 +950,24 @@ func mailArchiveText(ids: [Int64]) throws -> String {
             if (!mbx) return -1;
             try { return mbx.messages.whose({messageId: mid}).length; } catch (e) { return -1; }
           }
+          // A Trash->All Mail refile can half-complete: the server-side move
+          // happens but Mail.app quarantines its local copy into an
+          // application-level "Recovered Messages (<acct>)" mailbox (seen
+          // 2026-07-19, issue #4). Whose-clause lookup works there where plain
+          // iteration throws -1728; a move out of it refiles cleanly.
+          function rescueRecovered(mid, allmail) {
+            try {
+              const boxes = Mail.mailboxes;
+              for (let i = 0; i < boxes.length; i++) {
+                let nm = '';
+                try { nm = String(boxes[i].name()); } catch (e) {}
+                if (nm.indexOf('Recovered') !== 0) continue;
+                const found = boxes[i].messages.whose({messageId: mid});
+                if (found.length > 0) { Mail.move(found[0], {to: allmail}); return true; }
+              }
+            } catch (e) {}
+            return false;
+          }
           const out = [];
           for (const job of jobs) {
             try {
@@ -1004,9 +1022,26 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                     delay(0.5);
                   }
                 }
-                const inb = hits(inbox, job.mid), am = hits(allmail, job.mid), tr = hits(trash, job.mid);
+                let inb = hits(inbox, job.mid), am = hits(allmail, job.mid), tr = hits(trash, job.mid);
+                if (tr > 0) {
+                  // Refile didn't stick inside the settle budget. Before
+                  // declaring a stuck state, give slow IMAP sync one extended
+                  // window — the 7/19 incident reconciled itself ~a minute
+                  // after the tool had already errored.
+                  for (let attempt = 0; attempt < 20; attempt++) {
+                    delay(0.5);
+                    tr = hits(trash, job.mid);
+                    if (tr === 0) break;
+                  }
+                  am = hits(allmail, job.mid);
+                  inb = hits(inbox, job.mid);
+                }
+                // Half-completed refiles strand a local copy in "Recovered
+                // Messages"; sweep it back into All Mail either way.
+                const rescued = rescueRecovered(job.mid, allmail);
+                if (rescued) { am = hits(allmail, job.mid); tr = hits(trash, job.mid); }
                 if (inb === 0 && am > 0 && tr === 0) {
-                  out.push(job.id + '\\tOK\\tarchived (INBOX label removed; in All Mail)');
+                  out.push(job.id + '\\tOK\\tarchived (INBOX label removed; in All Mail' + (rescued ? '; rescued a stray local copy from Recovered Messages' : '') + ')');
                 } else if (inb > 0) {
                   out.push(job.id + '\\tERR\\tstill in INBOX after archive (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
                 } else if (tr > 0) {
@@ -1036,11 +1071,12 @@ func mailArchiveText(ids: [Int64]) throws -> String {
           return out.join('\\n');
         }
         """
-        // Gmail jobs can poll up to ~20s each (2 × 10s settle loops); a flat
+        // Gmail jobs can poll up to ~30s each (2 × 10s settle loops + a 10s
+        // extended stuck-state window) plus a Recovered Messages sweep; a flat
         // 90s cap would kill multi-message batches mid-flight and lose the
         // per-id results of already-completed jobs. Scale with job count.
         let gmailJobs = jobs.filter { $0.gmail }.count
-        let budget = max(90.0, Double(gmailJobs) * 25.0 + 15.0)
+        let budget = max(90.0, Double(gmailJobs) * 40.0 + 15.0)
         let raw = try runJXA(source, timeout: budget)
         for line in raw.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
