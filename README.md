@@ -86,6 +86,8 @@ mac-kit mail search "Alaska" --since 2026-06-01     # matches subject or sender
 mac-kit mail search invoice --account iCloud --mailbox INBOX
 mac-kit mail read 31797                             # id from search/unread output
 mac-kit mail send you@example.com --subject "Hi" --body "..." --from Google
+mac-kit mail send you@example.com --subject "Report" --body "..." --from Google \
+  --attach /tmp/report.pdf --attach ~/Pictures/chart.png   # repeatable; must exist
 ```
 
 Notes:
@@ -145,7 +147,7 @@ Speaks MCP over stdio (newline-delimited JSON-RPC 2.0). Exposes twenty tools:
 | `mail_unread` | `account`, `limit` (default 20) | Unread messages, newest first: `[id] date subject / from (account / mailbox)` |
 | `mail_search` | `query` (required), `account`, `mailbox`, `since`, `limit` (default 20) | Matching messages in the same shape, with ids for `mail_read` |
 | `mail_read` | `id` (required) | Headers (from/to/cc/date/subject/mailbox) + text body (~6000 chars) |
-| `mail_send` | `to`, `subject`, `body` (required), `from_account`, `cc`, `bcc` | Send confirmation (sends immediately via Mail.app) |
+| `mail_send` | `to`, `subject`, `body` (required), `from_account`, `cc`, `bcc`, `attachments[]` (absolute paths, `~` expanded) | Send confirmation (sends immediately via Mail.app). `from_account` is validated against the mounted accounts and resolved to the exact address — Mail's raw `sender` property silently falls back to the default account, this tool errors instead (listing accounts; ambiguous duplicate names error too). Attachment paths are checked on disk before composing; any bad path aborts with nothing sent |
 | `mail_archive` | `id` or `ids[]` (from `mail_search`/`mail_unread`) | Takes messages out of the inbox. Standard IMAP (iCloud/custom domains): moves INBOX → Archive. Gmail: removes the INBOX label (a plain move to All Mail is a server-side no-op, so it deletes the INBOX copy then refiles it into All Mail — both real IMAP moves; the message ends up archived in All Mail). Re-checks mailbox membership after and reports the resulting state per id. Reversible — never deletes |
 | `notes_list` | `query`, `limit` (default 20) | Note metadata only (never bodies): name, folder (null for shared notes), modified, hasAttachments, id. Newest first |
 | `notes_read` | `name` or `id` | HTML body + plaintext + hasAttachments + `revision` (SHA-256 of body). Errors listing candidate ids if several notes share the name |

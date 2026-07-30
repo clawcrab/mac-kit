@@ -254,6 +254,72 @@ struct SelfTestCommand: ParsableCommand {
             with: Data(jsLiteral(nasty).utf8), options: [.fragmentsAllowed])) as? String
         t.equal(decoded, nasty, "jsLiteral lossless round-trip (CAS body comparison relies on this)")
 
+        // MARK: mail_send attachment path normalization
+
+        t.equal(mailAttachmentAbsolutePath("/tmp/a.png", home: "/Users/x"), "/tmp/a.png",
+                "attachment path absolute passes through")
+        t.equal(mailAttachmentAbsolutePath("~/a.png", home: "/Users/x"), "/Users/x/a.png",
+                "attachment path tilde expands")
+        t.equal(mailAttachmentAbsolutePath("~", home: "/Users/x"), "/Users/x",
+                "attachment path bare tilde expands")
+        t.check(mailAttachmentAbsolutePath("a.png", home: "/Users/x") == nil,
+                "attachment path relative rejected")
+        t.check(mailAttachmentAbsolutePath("~user/a.png", home: "/Users/x") == nil,
+                "attachment path other-user tilde rejected")
+        t.equal(mailAttachmentAbsolutePath("/tmp/trailing space.png ", home: "/Users/x"),
+                "/tmp/trailing space.png ",
+                "attachment path bytes untouched (no trim of trailing space)")
+
+        // MARK: mail_send sender resolution (silent-fallback trap guard)
+
+        let accounts = [
+            MailSendAccount(name: "iCloud", fullName: "Jane Appleseed",
+                            emails: ["a@me.com", "a@icloud.com"]),
+            MailSendAccount(name: "Google", fullName: "Jane Appleseed",
+                            emails: ["a@gmail.com"]),
+            MailSendAccount(name: "Empty", fullName: "Jane Appleseed", emails: [])
+        ]
+        t.equal(resolveMailSender(accounts: accounts, query: "a@icloud.com"),
+                .resolved("Jane Appleseed <a@icloud.com>"),
+                "sender resolves to EXACT matched address, not the account's first")
+        t.equal(resolveMailSender(accounts: accounts, query: "A@GMAIL.COM"),
+                .resolved("Jane Appleseed <a@gmail.com>"),
+                "sender address match is case-insensitive")
+        t.equal(resolveMailSender(accounts: accounts, query: "google"),
+                .resolved("Jane Appleseed <a@gmail.com>"),
+                "sender name match resolves to primary address")
+        switch resolveMailSender(accounts: accounts, query: "bogus-account") {
+        case .resolved: t.check(false, "sender bogus query must fail")
+        case .failed(let message):
+            t.check(message.contains("no Mail account matches") && message.contains("a@gmail.com")
+                        && message.contains("nothing sent"),
+                    "sender no-match error lists accounts and confirms nothing sent")
+        }
+        let dupAccounts = accounts + [
+            MailSendAccount(name: "Google", fullName: "Other Persona", emails: ["b@gmail.com"])
+        ]
+        switch resolveMailSender(accounts: dupAccounts, query: "Google") {
+        case .resolved: t.check(false, "sender ambiguous name must fail")
+        case .failed(let message):
+            t.check(message.contains("ambiguous") && message.contains("a@gmail.com")
+                        && message.contains("b@gmail.com") && message.contains("address"),
+                    "sender ambiguous-name error lists all candidates and asks for an address")
+        }
+        t.equal(resolveMailSender(accounts: dupAccounts, query: "b@gmail.com"),
+                .resolved("Other Persona <b@gmail.com>"),
+                "sender exact address disambiguates duplicate account names")
+        switch resolveMailSender(accounts: accounts, query: "Empty") {
+        case .resolved: t.check(false, "sender addressless account must fail")
+        case .failed(let message):
+            t.check(message.contains("no email addresses"),
+                    "sender addressless-account error explains the problem")
+        }
+        t.equal(resolveMailSender(accounts: [MailSendAccount(name: "X", fullName: "",
+                                                             emails: ["x@y.z"])],
+                                  query: "x@y.z"),
+                .resolved("x@y.z"),
+                "sender without fullName is the bare address")
+
         try t.finish()
     }
 }

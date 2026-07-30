@@ -211,7 +211,7 @@ struct MCPServer {
         ],
         [
             "name": "mail_send",
-            "description": "Send an email through Mail.app (AppleScript) — sends immediately, no draft step. Optionally pick the sending account by name or address; otherwise Mail's default account is used. Requires macOS Automation permission for Mail.",
+            "description": "Send an email through Mail.app (AppleScript) — sends immediately, no draft step. Optionally pick the sending account by name or address; otherwise Mail's default account is used. Mail.app's raw `sender` property silently falls back to the default account when the value is unvalidated — this tool validates from_account against mounted accounts and errors (listing the available accounts) instead of ever sending from the wrong address. Attachments are checked on disk before sending; any missing path aborts the send. Requires macOS Automation permission for Mail.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -220,10 +220,15 @@ struct MCPServer {
                     "body": ["type": "string", "description": "Plain-text body"],
                     "from_account": [
                         "type": "string",
-                        "description": "Optional sending account: account name (e.g. \"Google\") or an address on it"
+                        "description": "Optional sending account: account name (e.g. \"Google\") or an address on it. Validated against Mail.app's mounted accounts — errors listing available accounts if there is no match, and errors if several accounts share the queried name (pass an address instead); never falls back silently."
                     ],
                     "cc": ["type": "string", "description": "Cc address(es), comma-separated"],
-                    "bcc": ["type": "string", "description": "Bcc address(es), comma-separated"]
+                    "bcc": ["type": "string", "description": "Bcc address(es), comma-separated"],
+                    "attachments": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Optional absolute POSIX file paths to attach (~ is expanded). Each must exist or the send is aborted with the missing paths listed."
+                    ]
                 ],
                 "required": ["to", "subject", "body"]
             ]
@@ -466,11 +471,27 @@ struct MCPServer {
                 guard let body = args["body"] as? String else {
                     throw ToolError("mail_send requires \"body\"")
                 }
+                // A present-but-malformed "attachments" value must be a hard
+                // error: treating it as absent would silently send WITHOUT the
+                // requested attachments.
+                var attachments: [String] = []
+                if let rawAttachments = args["attachments"], !(rawAttachments is NSNull) {
+                    guard let array = rawAttachments as? [Any] else {
+                        throw ToolError("mail_send \"attachments\" must be an array of path strings — nothing sent")
+                    }
+                    for element in array {
+                        guard let path = element as? String else {
+                            throw ToolError("mail_send \"attachments\" must be an array of path strings — nothing sent")
+                        }
+                        attachments.append(path)
+                    }
+                }
                 text = try mailSendText(
                     to: to, subject: subject, body: body,
                     fromAccount: args["from_account"] as? String,
                     cc: args["cc"] as? String,
-                    bcc: args["bcc"] as? String
+                    bcc: args["bcc"] as? String,
+                    attachments: attachments
                 )
             case "notes_list":
                 let query = args["query"] as? String

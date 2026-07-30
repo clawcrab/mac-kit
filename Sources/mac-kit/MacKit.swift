@@ -285,9 +285,14 @@ struct MailSend: ParsableCommand {
     @Option(help: "Bcc address(es), comma-separated")
     var bcc: String?
 
+    @Option(name: .customLong("attach"),
+            help: "Absolute path of a file to attach (repeatable; must exist)")
+    var attach: [String] = []
+
     func run() throws {
         print(try mailSendText(to: to, subject: subject, body: body,
-                               fromAccount: fromAccount, cc: cc, bcc: bcc))
+                               fromAccount: fromAccount, cc: cc, bcc: bcc,
+                               attachments: attach))
     }
 }
 

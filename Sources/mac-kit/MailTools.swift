@@ -783,8 +783,108 @@ func mailReadText(id: Int64) throws -> String {
     return lines.joined(separator: "\n")
 }
 
+/// Expand a leading `~` and require an absolute path. Returns nil when the
+/// path is not absolute after expansion. Path bytes are otherwise untouched —
+/// filenames may legitimately end in spaces, so nothing is trimmed here.
+/// (Pure helper; exercised in self-test.)
+func mailAttachmentAbsolutePath(_ raw: String, home: String) -> String? {
+    var path = raw
+    if path == "~" {
+        path = home
+    } else if path.hasPrefix("~/") {
+        path = home + String(path.dropFirst(1))
+    }
+    return path.hasPrefix("/") ? path : nil
+}
+
+// MARK: mail_send sender resolution
+//
+// Mail.app's `sender` property silently falls back to the DEFAULT account
+// when the value doesn't correspond to a mounted account — mail can go out
+// from the wrong address with no error (two real incidents, 2026-07-29).
+// So mail_send enumerates the mounted accounts first (read-only JXA), then
+// resolves from_account in Swift with this pure, self-tested function, and
+// refuses to send when nothing matches or the match is ambiguous.
+
+struct MailSendAccount {
+    let name: String       // Mail.app account name, e.g. "Google"
+    let fullName: String   // sender display name, e.g. "Jane Appleseed"
+    let emails: [String]   // addresses mounted on the account, primary first
+}
+
+enum MailSenderResolution: Equatable {
+    case resolved(String)   // exact "Full Name <address>" (or bare address)
+    case failed(String)     // human-readable refusal; nothing may be sent
+}
+
+/// Resolve a from_account query to an exact RFC 5322 sender string.
+/// Match rules (case-insensitive, exact — no substrings):
+///   1. An address match wins and resolves to that EXACT address.
+///   2. Otherwise an account-name match resolves to the account's primary
+///      address — but several accounts sharing the name is an error (Mail
+///      does not enforce unique names); the caller must pass an address.
+///   3. No match: error listing every mounted account and address.
+func resolveMailSender(accounts: [MailSendAccount], query: String) -> MailSenderResolution {
+    let needle = query.lowercased()
+    func sender(_ account: MailSendAccount, _ address: String) -> String {
+        account.fullName.isEmpty ? address : "\(account.fullName) <\(address)>"
+    }
+    let listing = accounts.map { "\($0.name) <\($0.emails.joined(separator: ", "))>" }
+        .joined(separator: "; ")
+
+    for account in accounts {
+        if let address = account.emails.first(where: { $0.lowercased() == needle }) {
+            return .resolved(sender(account, address))
+        }
+    }
+    let nameMatches = accounts.filter { $0.name.lowercased() == needle }
+    if nameMatches.count > 1 {
+        let candidates = nameMatches.map { "\($0.name) <\($0.emails.joined(separator: ", "))>" }
+            .joined(separator: "; ")
+        return .failed("account name \"\(query)\" is ambiguous — \(nameMatches.count) accounts share it: "
+            + candidates + ". Pass one of the addresses instead. Nothing sent.")
+    }
+    if let match = nameMatches.first {
+        guard let primary = match.emails.first else {
+            return .failed("account \"\(match.name)\" has no email addresses mounted — nothing sent. Accounts: " + listing)
+        }
+        return .resolved(sender(match, primary))
+    }
+    return .failed("no Mail account matches \"\(query)\" — nothing sent. Accounts: " + listing)
+}
+
+/// Enumerate Mail.app's mounted accounts (read-only; no mutation).
+private func mailSendEnumerateAccounts() throws -> [MailSendAccount] {
+    let source = """
+    function run() {
+      const Mail = Application('Mail');
+      const out = [];
+      for (const account of Mail.accounts()) {
+        let emails = [];
+        try { emails = account.emailAddresses().map(String); } catch (e) {}
+        let fullName = '';
+        try { fullName = String(account.fullName()); } catch (e) {}
+        out.push({name: String(account.name()), fullName: fullName, emails: emails});
+      }
+      return JSON.stringify(out);
+    }
+    """
+    let raw = try runJXA(source, timeout: 20)
+    guard let parsed = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [[String: Any]] else {
+        throw ToolError("Could not enumerate Mail.app accounts (unexpected reply) — nothing sent")
+    }
+    return parsed.map {
+        MailSendAccount(
+            name: $0["name"] as? String ?? "",
+            fullName: $0["fullName"] as? String ?? "",
+            emails: ($0["emails"] as? [Any] ?? []).compactMap { $0 as? String }
+        )
+    }
+}
+
 func mailSendText(to: String, subject: String, body: String,
-                  fromAccount: String?, cc: String?, bcc: String?) throws -> String {
+                  fromAccount: String?, cc: String?, bcc: String?,
+                  attachments: [String] = []) throws -> String {
     func addressList(_ raw: String?) -> [String] {
         (raw ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
@@ -792,32 +892,81 @@ func mailSendText(to: String, subject: String, body: String,
     let toList = addressList(to)
     guard !toList.isEmpty else { throw ToolError("mail_send requires at least one \"to\" address") }
 
+    // Attachment validation happens HERE, before any Mail.app mutation: every
+    // entry must be non-blank, absolute (after ~ expansion), and point at a
+    // readable regular file. Mail.app itself silently sends without the
+    // attachment when a path is bad, so a filesystem check is the only
+    // reliable guard. Blank entries are an error, not a skip — a request that
+    // asked for attachments must never silently collapse into a send without
+    // them. Paths are used byte-for-byte (filenames may end in spaces).
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    var attachPaths: [String] = []
+    var totalAttachmentBytes: Int64 = 0
+    var badPaths: [String] = []
+    for (index, raw) in attachments.enumerated() {
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            badPaths.append("attachments[\(index)] is empty")
+            continue
+        }
+        guard let absolute = mailAttachmentAbsolutePath(raw, home: home) else {
+            badPaths.append("\(raw) (not an absolute path)")
+            continue
+        }
+        // Resolve symlinks so Mail attaches the real file; require a readable
+        // REGULAR file (rejects directories, FIFOs, sockets, devices). The
+        // file can still change or vanish between this check and Mail reading
+        // it — TOCTOU is an accepted residual risk; no staging copies.
+        let resolved = URL(fileURLWithPath: absolute).resolvingSymlinksInPath().path
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDirectory) else {
+            badPaths.append("\(absolute) (no such file)")
+            continue
+        }
+        if isDirectory.boolValue {
+            badPaths.append("\(absolute) (is a directory — attach files only)")
+            continue
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: resolved)
+        guard (attributes?[.type] as? FileAttributeType) == .typeRegular else {
+            badPaths.append("\(absolute) (not a regular file)")
+            continue
+        }
+        guard FileManager.default.isReadableFile(atPath: resolved) else {
+            badPaths.append("\(absolute) (not readable)")
+            continue
+        }
+        totalAttachmentBytes += (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+        attachPaths.append(resolved)
+    }
+    if !badPaths.isEmpty {
+        throw ToolError("mail_send: invalid attachment path(s), nothing sent: "
+            + badPaths.joined(separator: "; "))
+    }
+
+    // Strict sender resolution BEFORE composing anything (see resolveMailSender).
+    var sender = ""
+    if let fromAccount, !fromAccount.isEmpty {
+        switch resolveMailSender(accounts: try mailSendEnumerateAccounts(), query: fromAccount) {
+        case .resolved(let resolved): sender = resolved
+        case .failed(let message): throw ToolError(message)
+        }
+    }
+
+    // Attachment readiness poll budget: base 10s plus 1s per MB, capped so a
+    // huge file can't push the osascript run past a sane bound.
+    let pollSeconds = min(40, 10 + Int(totalAttachmentBytes / 1_048_576))
+
     let source = """
     function run() {
       const Mail = Application('Mail');
       const to = \(jsLiteral(toList.joined(separator: "\n"))).split('\\n');
       const cc = \(jsLiteral(addressList(cc).joined(separator: "\n")));
       const bcc = \(jsLiteral(addressList(bcc).joined(separator: "\n")));
-      const fromQuery = \(jsLiteral(fromAccount ?? ""));
-
-      let sender = null;
-      if (fromQuery) {
-        const needle = fromQuery.toLowerCase();
-        const names = [];
-        for (const account of Mail.accounts()) {
-          const name = String(account.name());
-          const emails = account.emailAddresses().map(String);
-          names.push(name + ' <' + emails.join(', ') + '>');
-          if (name.toLowerCase() === needle
-              || emails.some(e => e.toLowerCase() === needle)) {
-            sender = String(account.fullName()) + ' <' + emails[0] + '>';
-            break;
-          }
-        }
-        if (!sender) {
-          return 'ERR: no Mail account matches "' + fromQuery + '". Accounts: ' + names.join('; ');
-        }
-      }
+      const sender = \(jsLiteral(sender));
+      const attachJSON = \(jsLiteral((try? String(
+          decoding: JSONSerialization.data(withJSONObject: attachPaths), as: UTF8.self)) ?? "[]"));
+      const attachPaths = JSON.parse(attachJSON);
+      const pollSeconds = \(pollSeconds);
 
       const msg = Mail.OutgoingMessage({
         subject: \(jsLiteral(subject)),
@@ -825,27 +974,88 @@ func mailSendText(to: String, subject: String, body: String,
         visible: false
       });
       Mail.outgoingMessages.push(msg);
-      if (sender) { msg.sender = sender; }
-      for (const address of to) {
-        msg.toRecipients.push(Mail.ToRecipient({address: address}));
-      }
-      if (cc) {
-        for (const address of cc.split('\\n')) {
-          msg.ccRecipients.push(Mail.CcRecipient({address: address}));
+      // From here the outgoing message EXISTS in Mail.app: any failure before
+      // Mail.send must delete it (no orphaned invisible drafts), and nothing
+      // after Mail.send may be reported as a hard failure — the message may
+      // already be on the wire.
+      try {
+        if (sender) { msg.sender = sender; }
+        for (const address of to) {
+          msg.toRecipients.push(Mail.ToRecipient({address: address}));
         }
-      }
-      if (bcc) {
-        for (const address of bcc.split('\\n')) {
-          msg.bccRecipients.push(Mail.BccRecipient({address: address}));
+        if (cc) {
+          for (const address of cc.split('\\n')) {
+            msg.ccRecipients.push(Mail.CcRecipient({address: address}));
+          }
         }
+        if (bcc) {
+          for (const address of bcc.split('\\n')) {
+            msg.bccRecipients.push(Mail.BccRecipient({address: address}));
+          }
+        }
+        for (const path of attachPaths) {
+          msg.attachments.push(Mail.Attachment({fileName: Path(path)}));
+        }
+        if (attachPaths.length > 0) {
+          // Mail.app registers attachments asynchronously; sending too early
+          // can drop them. Poll readiness instead of a blind sleep: ready when
+          // the attachment count matches AND either every attachment reports a
+          // positive fileSize (content registered) or the legacy 2s floor has
+          // elapsed (fileSize is unreadable on some macOS builds — fall back
+          // to the known-good fixed delay rather than spinning to a false
+          // timeout). The fixed sleep below is only the inter-poll interval.
+          const started = Date.now();
+          const deadline = started + pollSeconds * 1000;
+          let ready = false;
+          while (Date.now() < deadline) {
+            let count = -1;
+            try { count = msg.attachments.length; } catch (e) {}
+            if (count >= attachPaths.length) {
+              let sizesOK = false;
+              try {
+                const atts = msg.attachments();
+                sizesOK = atts.length >= attachPaths.length;
+                for (let i = 0; i < atts.length && sizesOK; i++) {
+                  if (!(Number(atts[i].fileSize()) > 0)) { sizesOK = false; }
+                }
+              } catch (e) { sizesOK = false; }
+              if (sizesOK || Date.now() - started >= 2000) { ready = true; break; }
+            }
+            delay(0.5);
+          }
+          if (!ready) {
+            throw new Error('attachments did not register within ' + pollSeconds + 's ('
+              + attachPaths.length + ' requested)');
+          }
+        }
+      } catch (e) {
+        try { msg.delete(); } catch (cleanupError) {}
+        return 'ERR: ' + e + ' — outgoing message discarded, nothing sent';
       }
-      Mail.send(msg);
+      try {
+        Mail.send(msg);
+      } catch (e) {
+        return 'UNKNOWN: Mail.send raised (' + e + ') — the message may or may not'
+          + ' have gone out; check the Sent mailbox and Mail.app compose windows'
+          + ' before retrying';
+      }
       return 'Sent "' + \(jsLiteral(subject)) + '" to ' + to.join(', ')
-        + (sender ? ' from ' + sender : ' from the default account');
+        + (sender ? ' from ' + sender : ' from the default account')
+        + (attachPaths.length > 0 ? ' with ' + attachPaths.length + ' attachment(s)' : '');
     }
     """
-    let result = try runJXA(source, timeout: 30)
+    let result: String
+    do {
+        result = try runJXA(source, timeout: attachPaths.isEmpty ? 30 : Double(pollSeconds + 30))
+    } catch let error as ToolError where error.message.contains("timed out") {
+        // The osascript process was killed mid-flight — we cannot know whether
+        // Mail.send had already fired. Never claim a clean failure here.
+        throw ToolError("mail_send timed out — state UNKNOWN: the message may or may not have been sent; "
+            + "check the Sent mailbox and Mail.app compose windows before retrying")
+    }
     if result.hasPrefix("ERR:") { throw ToolError(String(result.dropFirst(4)).trimmingCharacters(in: .whitespaces)) }
+    // "UNKNOWN:" results pass through as text, not as a thrown error: the send
+    // mutation may have happened, so reporting must be a warning, not a failure.
     return result
 }
 
