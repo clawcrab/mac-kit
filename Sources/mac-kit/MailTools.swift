@@ -1138,10 +1138,27 @@ func mailArchiveText(ids: [Int64]) throws -> String {
              "target": $0.target, "gmail": $0.gmail ? "1" : "0"]
         }
         let json = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
+        // Gmail jobs can poll up to ~30s each (2 × 10s settle loops + a 10s
+        // extended stuck-state window) plus a Recovered Messages sweep; a flat
+        // 90s cap would kill multi-message batches mid-flight and lose the
+        // per-id results of already-completed jobs. Scale with job count.
+        let gmailJobs = jobs.filter { $0.gmail }.count
+        let budget = max(90.0, Double(gmailJobs) * 40.0 + 15.0)
+        // The script gets told the cap so it can stop waiting and report,
+        // rather than being killed with nothing to say. Give it a margin.
+        let scriptBudget = Int(budget - 10)
         let source = """
         function run() {
           const Mail = Application('Mail');
           const jobs = JSON.parse(\(jsLiteral(json)));
+          // The caller kills this script at a hard cap. Everything below that
+          // is optional waiting must yield before then, or the run dies with
+          // no per-id results at all — and, worse, dies *before* the cleanup
+          // that puts stranded mail back (2026-08-02: a single job burned the
+          // whole 90s and left a message sitting in "Recovered Messages").
+          const T0 = Date.now();
+          const BUDGET_MS = \(scriptBudget) * 1000;
+          function msLeft() { return BUDGET_MS - (Date.now() - T0); }
           function mbxByName(account, wanted) {
             const boxes = account.mailboxes;
             for (let i = 0; i < boxes.length; i++) {
@@ -1233,12 +1250,20 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                   }
                 }
                 let inb = hits(inbox, job.mid), am = hits(allmail, job.mid), tr = hits(trash, job.mid);
+                // Sweep Recovered Messages BEFORE the optional extended wait.
+                // A half-completed refile quarantines the local copy here, and
+                // this sweep is what undoes it — so it must not be the step
+                // that gets cut when time runs short. Running it twice is
+                // harmless: with nothing stranded it is one failed lookup.
+                let rescued = rescueRecovered(job.mid, allmail);
+                if (rescued) { am = hits(allmail, job.mid); tr = hits(trash, job.mid); }
                 if (tr > 0) {
                   // Refile didn't stick inside the settle budget. Before
                   // declaring a stuck state, give slow IMAP sync one extended
                   // window — the 7/19 incident reconciled itself ~a minute
-                  // after the tool had already errored.
-                  for (let attempt = 0; attempt < 20; attempt++) {
+                  // after the tool had already errored. Only spend that window
+                  // if there is time left for the remaining jobs to report.
+                  for (let attempt = 0; attempt < 20 && msLeft() > 15000; attempt++) {
                     delay(0.5);
                     tr = hits(trash, job.mid);
                     if (tr === 0) break;
@@ -1246,9 +1271,7 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                   am = hits(allmail, job.mid);
                   inb = hits(inbox, job.mid);
                 }
-                // Half-completed refiles strand a local copy in "Recovered
-                // Messages"; sweep it back into All Mail either way.
-                const rescued = rescueRecovered(job.mid, allmail);
+                rescued = rescueRecovered(job.mid, allmail) || rescued;
                 if (rescued) { am = hits(allmail, job.mid); tr = hits(trash, job.mid); }
                 if (inb === 0 && am > 0 && tr === 0) {
                   out.push(job.id + '\\tOK\\tarchived (INBOX label removed; in All Mail' + (rescued ? '; rescued a stray local copy from Recovered Messages' : '') + ')');
@@ -1257,7 +1280,16 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                 } else if (tr > 0) {
                   out.push(job.id + '\\tERR\\tleft in Trash, not refiled to All Mail — recover from Gmail Trash (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
                 } else {
-                  out.push(job.id + '\\tOK\\tremoved from INBOX (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
+                  // Nowhere: gone from INBOX, but not in All Mail or Trash
+                  // either. This used to report OK, on the reasoning that
+                  // leaving the INBOX was the job. It isn't — archiving means
+                  // the message is IN All Mail, and "absent from the three
+                  // places I looked" is not that. Mail.app quarantines
+                  // half-refiled copies into "Recovered Messages (<acct>)",
+                  // which none of these counts cover, so a message could
+                  // vanish into it and still be reported archived. 34 of them
+                  // did, over two weeks, before anyone noticed (2026-08-02).
+                  out.push(job.id + '\\tERR\\tnot in INBOX, All Mail, or Trash — state unknown, check "Recovered Messages" in Mail.app (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
                 }
               } else {
                 // Standard IMAP: a real move INBOX -> Archive.
@@ -1281,12 +1313,6 @@ func mailArchiveText(ids: [Int64]) throws -> String {
           return out.join('\\n');
         }
         """
-        // Gmail jobs can poll up to ~30s each (2 × 10s settle loops + a 10s
-        // extended stuck-state window) plus a Recovered Messages sweep; a flat
-        // 90s cap would kill multi-message batches mid-flight and lose the
-        // per-id results of already-completed jobs. Scale with job count.
-        let gmailJobs = jobs.filter { $0.gmail }.count
-        let budget = max(90.0, Double(gmailJobs) * 40.0 + 15.0)
         let raw = try runJXA(source, timeout: budget)
         for line in raw.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
