@@ -1093,6 +1093,55 @@ func mailSendText(to: String, subject: String, body: String,
 // messageId`. All lookups iterate account.mailboxes by name rather than using
 // `by name` specifiers, which return broken references for Gmail mailboxes.
 
+/// Move any messages Mail.app quarantined into a "Recovered Messages (<acct>)"
+/// mailbox back into All Mail, and report which message-ids were found there.
+///
+/// This runs as its own short process, on purpose. The archive script does the
+/// same sweep at the end of each job, but a script that gets killed at the
+/// timeout never reaches its own ending — on 2026-08-03 three messages were
+/// stranded exactly that way, the morning after the in-script sweep was added.
+/// A repair step is only worth having where the failure it repairs cannot also
+/// prevent it from running.
+///
+/// Deliberately small: one whose-clause lookup per id per Recovered mailbox,
+/// no polling, no settle loops. It has to finish.
+private func sweepRecoveredMessages(messageIDs: [String]) -> Set<String> {
+    guard !messageIDs.isEmpty else { return [] }
+    let json = String(
+        decoding: (try? JSONSerialization.data(withJSONObject: messageIDs)) ?? Data(), as: UTF8.self)
+    let source = """
+    function run() {
+      const Mail = Application('Mail');
+      const ids = JSON.parse(\(jsLiteral(json)));
+      let allmail = null;
+      const accts = Mail.accounts;
+      for (let a = 0; a < accts.length && !allmail; a++) {
+        const boxes = accts[a].mailboxes;
+        for (let b = 0; b < boxes.length; b++) {
+          try { if (String(boxes[b].name()) === 'All Mail') { allmail = boxes[b]; break; } } catch (e) {}
+        }
+      }
+      if (!allmail) return '';
+      const found = [];
+      const boxes = Mail.mailboxes;
+      for (let i = 0; i < boxes.length; i++) {
+        let nm = '';
+        try { nm = String(boxes[i].name()); } catch (e) { continue; }
+        if (nm.indexOf('Recovered') !== 0) continue;
+        for (let k = 0; k < ids.length; k++) {
+          try {
+            const hits = boxes[i].messages.whose({messageId: ids[k]});
+            if (hits.length > 0) { Mail.move(hits[0], {to: allmail}); found.push(ids[k]); }
+          } catch (e) {}
+        }
+      }
+      return found.join('\\n');
+    }
+    """
+    guard let raw = try? runJXA(source, timeout: 45) else { return [] }
+    return Set(raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty })
+}
+
 func mailArchiveText(ids: [Int64]) throws -> String {
     guard !ids.isEmpty else { throw ToolError("mail_archive requires at least one id") }
     let store = try MailStore()
@@ -1313,16 +1362,44 @@ func mailArchiveText(ids: [Int64]) throws -> String {
           return out.join('\\n');
         }
         """
-        let raw = try runJXA(source, timeout: budget)
+        // A timeout kills the script outright, so nothing it was going to do
+        // afterwards happens — including the Recovered Messages sweep and the
+        // error it would have reported. Catch the throw, then run the sweep
+        // from here: a second, short-lived process that the dead one's clock
+        // cannot reach. Cleanup that lives inside the thing that can die is
+        // not cleanup.
+        var raw = ""
+        var timedOut = false
+        do {
+            raw = try runJXA(source, timeout: budget)
+        } catch {
+            timedOut = true
+        }
         for line in raw.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 3, let rid = Int64(parts[0]) else { continue }
             results[rid] = Outcome(id: rid, ok: parts[1] == "OK",
                                    message: parts[2...].joined(separator: "\t"))
         }
-        // Any job with no line back is a failure we shouldn't silently drop.
-        for job in jobs where results[job.id] == nil {
-            results[job.id] = Outcome(id: job.id, ok: false, message: "no result returned from Mail.app")
+        // Jobs with no line back either never ran or were cut off mid-move.
+        // Either way the message may be sitting in the quarantine mailbox, so
+        // sweep before deciding what to say about them.
+        let unreported = jobs.filter { results[$0.id] == nil }
+        if !unreported.isEmpty {
+            let rescued = sweepRecoveredMessages(messageIDs: unreported.map { $0.mid })
+            for job in unreported {
+                if rescued.contains(job.mid) {
+                    results[job.id] = Outcome(
+                        id: job.id, ok: true,
+                        message: "archived (Mail.app stranded it in Recovered Messages; swept back to All Mail)")
+                } else {
+                    results[job.id] = Outcome(
+                        id: job.id, ok: false,
+                        message: timedOut
+                            ? "timed out with no result and nothing stranded — verify in Mail.app before retrying"
+                            : "no result returned from Mail.app")
+                }
+            }
         }
     }
 
