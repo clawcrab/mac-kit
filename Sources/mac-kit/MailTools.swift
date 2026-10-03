@@ -1187,12 +1187,13 @@ func mailArchiveText(ids: [Int64]) throws -> String {
              "target": $0.target, "gmail": $0.gmail ? "1" : "0"]
         }
         let json = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
-        // Gmail jobs can poll up to ~30s each (2 × 10s settle loops + a 10s
-        // extended stuck-state window) plus a Recovered Messages sweep; a flat
+        // Gmail jobs can poll up to ~40s each (3 × 10s settle loops — the
+        // third is the late-Trash window — + a 10s extended stuck-state
+        // window) plus a Recovered Messages sweep; a flat
         // 90s cap would kill multi-message batches mid-flight and lose the
         // per-id results of already-completed jobs. Scale with job count.
         let gmailJobs = jobs.filter { $0.gmail }.count
-        let budget = max(90.0, Double(gmailJobs) * 40.0 + 15.0)
+        let budget = max(90.0, Double(gmailJobs) * 50.0 + 15.0)
         // The script gets told the cap so it can stop waiting and report,
         // rather than being killed with nothing to say. Give it a margin.
         let scriptBudget = Int(budget - 10)
@@ -1261,7 +1262,8 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                 if (!trash) { out.push(job.id + '\\tERR\\tno Trash mailbox on Gmail account'); continue; }
                 const inInbox = inbox.messages.whose({messageId: job.mid});
                 if (inInbox.length === 0) {
-                  if (hits(allmail, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (not in INBOX; in All Mail)'); }
+                  if (hits(trash, job.mid) > 0) { out.push(job.id + '\\tERR\\tnot in INBOX but still in Trash — an earlier archive stranded it; move it to All Mail by hand'); }
+                  else if (hits(allmail, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (not in INBOX; in All Mail)'); }
                   else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
                   continue;
                 }
@@ -1283,11 +1285,25 @@ func mailArchiveText(ids: [Int64]) throws -> String {
                 // has an All Mail copy, so mid-flight (INBOX gone, Trash not
                 // yet visible) looks identical to reconciled-success.
                 if (trashMsg === null) {
-                  if (hits(allmail, job.mid) > 0 && hits(inbox, job.mid) === 0 && hits(trash, job.mid) === 0) {
-                    reconciled = true;
-                  } else {
-                    out.push(job.id + '\\tERR\\tdeleted from INBOX but not visible in Trash or All Mail after 10s — state unknown, check Gmail before retrying');
-                    continue;
+                  // Slow syncs can take longer than the Trash poll to settle
+                  // (10/3: two messages reported "state unknown" here and were
+                  // in All Mail moments later; 9/30: one was stranded in Trash).
+                  // "INBOX gone, All Mail yes, Trash no" is both the reconciled
+                  // state and the in-flight state, so never stop early on it:
+                  // watch a full second window for a late Trash arrival, and
+                  // only call it reconciled if Trash stayed empty throughout.
+                  for (let attempt = 0; attempt < 20; attempt++) {
+                    const lt = trash.messages.whose({messageId: job.mid});
+                    if (lt.length > 0) { trashMsg = lt[0]; break; }
+                    delay(0.5);
+                  }
+                  if (trashMsg === null) {
+                    if (hits(allmail, job.mid) > 0 && hits(inbox, job.mid) === 0 && hits(trash, job.mid) === 0) {
+                      reconciled = true;
+                    } else {
+                      out.push(job.id + '\\tERR\\tdeleted from INBOX but not visible in Trash or All Mail after 20s — state unknown, check Gmail before retrying');
+                      continue;
+                    }
                   }
                 }
                 if (!reconciled) {
