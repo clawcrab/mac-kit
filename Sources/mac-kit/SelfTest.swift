@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import JavaScriptCore
 
 // MARK: - Self-test harness
 //
@@ -319,6 +320,56 @@ struct SelfTestCommand: ParsableCommand {
                                   query: "x@y.z"),
                 .resolved("x@y.z"),
                 "sender without fullName is the bare address")
+
+        // MARK: mail_archive Gmail criterion (target state reached, not symptom gone)
+        //
+        // gmailArchiveVerdictJS is the exact source the archive script runs in
+        // Mail.app; evaluate it here under JavaScriptCore. Arguments are the
+        // Mail.app ids of the fingerprint-matching copies per mailbox.
+
+        let js = JSContext()!
+        if #available(macOS 13.3, *) { js.isInspectable = false }
+        js.evaluateScript(gmailArchiveVerdictJS)
+        func verdict(_ state: String) -> String {
+            js.evaluateScript("gmailArchiveVerdict(\(state))")?.toString() ?? "<nil>"
+        }
+        t.equal(verdict("{inbox: [], allMail: [500], trash: []}"), "archived",
+                "gmail verdict: in All Mail only is archived")
+        t.equal(verdict("{inbox: [500], allMail: [500], trash: []}"), "inbox",
+                "gmail verdict: INBOX label still present is not archived")
+        t.equal(verdict("{inbox: [500], allMail: [500], trash: [501]}"), "inbox",
+                "gmail verdict: INBOX wins over everything else")
+        t.equal(verdict("{inbox: [], allMail: [], trash: [501]}"), "trash",
+                "gmail verdict: Trash only is left in Trash")
+        t.equal(verdict("{inbox: [], allMail: [], trash: []}"), "missing",
+                "gmail verdict: nowhere is not archived (the old else-OK bug)")
+        t.equal(verdict("{inbox: [], allMail: [502], trash: [501]}"), "archived",
+                "gmail verdict: stale Trash copy older than the refiled All Mail record is archived")
+        t.equal(verdict("{inbox: [], allMail: [500], trash: [501]}"), "trash",
+                "gmail verdict: Trash record newer than every All Mail record is left in Trash")
+        t.equal(verdict("{inbox: [], allMail: [500, 503], trash: [501, 502]}"), "archived",
+                "gmail verdict: newest record decides across several copies")
+        t.equal(verdict("{inbox: [], allMail: [500], trash: [501, 504]}"), "trash",
+                "gmail verdict: newest Trash copy beats an older refile")
+        t.equal(verdict("{inbox: [], allMail: null, trash: []}"), "unknown",
+                "gmail verdict: a failed All Mail lookup is unknown, not missing")
+        t.equal(verdict("{inbox: null, allMail: [500], trash: []}"), "unknown",
+                "gmail verdict: a failed INBOX lookup is unknown, not archived")
+        t.equal(verdict("{inbox: [], allMail: [500], trash: null}"), "unknown",
+                "gmail verdict: a failed Trash lookup is unknown, not archived")
+        t.equal(verdict("undefined"), "unknown", "gmail verdict: no state is unknown")
+        t.check(js.exception == nil, "gmail verdict: JS evaluated without exceptions")
+
+        // The whole archive script (with the criterion spliced in) must at least
+        // parse; JXA would otherwise fail every archive at run time. Parse only:
+        // the script is wrapped in a function that is never called.
+        let parser = JSContext()!
+        let script = mailArchiveScript(jobsJSON: "[]", scriptBudget: 80)
+        parser.evaluateScript("var parsed = typeof (function () {\n" + script + "\n; return run; })")
+        t.check(parser.exception == nil,
+                "mail_archive script parses (\(parser.exception?.toString() ?? "ok"))")
+        t.check(script.contains("function gmailArchiveVerdict("),
+                "mail_archive script embeds the tested criterion")
 
         try t.finish()
     }
