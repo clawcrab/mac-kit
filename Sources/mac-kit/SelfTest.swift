@@ -377,30 +377,69 @@ struct SelfTestCommand: ParsableCommand {
                 "fingerprint: null target Date fails the lookup")
         t.equal(evalJS("fingerprintFilter([], 1000)"), "[]", "fingerprint: no candidates is empty")
 
-        // Pre-check before anything is deleted.
-        t.equal(evalJS("gmailArchivePrecheck([500], [])"), "\"proceed\"",
-                "precheck: one INBOX match and a readable Trash baseline proceeds")
-        t.equal(evalJS("gmailArchivePrecheck([500], [480])"), "\"ambiguous\"",
-                "precheck: a Trash copy already present next to the INBOX one refuses to act")
-        t.equal(evalJS("gmailArchivePrecheck([500], null)"), "\"unknown\"",
+        // Pre-check before anything is deleted. `requested` is the INBOX lookup
+        // by the caller's exact row id; the fingerprint only verifies it.
+        func pre(_ requested: String, _ inbox: String, _ preTrash: String) -> String {
+            evalJS("gmailArchivePrecheck({id: 500, requested: \(requested), inbox: \(inbox), preTrash: \(preTrash)})")
+        }
+        t.equal(pre("[500]", "[500]", "[]"), "\"proceed\"",
+                "precheck: the requested row in INBOX with a clean Trash baseline proceeds")
+        t.equal(pre("[]", "[503]", "[]"), "\"not-in-inbox\"",
+                "precheck: requested row not in INBOX refuses even if another fingerprint match is")
+        t.equal(pre("[500]", "[503]", "[]"), "\"mismatch\"",
+                "precheck: requested row does not carry the fingerprint refuses")
+        t.equal(pre("[500]", "[500, 503]", "[]"), "\"ambiguous\"",
+                "precheck: a second INBOX fingerprint match refuses")
+        t.equal(pre("[500]", "[500]", "[480]"), "\"ambiguous\"",
+                "precheck: a Trash copy already present refuses")
+        t.equal(pre("[500]", "[500]", "null"), "\"unknown\"",
                 "precheck: failed Trash baseline aborts before deleting")
-        t.equal(evalJS("gmailArchivePrecheck(null, [])"), "\"unknown\"",
-                "precheck: failed INBOX lookup aborts")
-        t.equal(evalJS("gmailArchivePrecheck([500, 503], [])"), "\"ambiguous\"",
-                "precheck: two INBOX matches refuse to act instead of taking the first")
-        t.equal(evalJS("gmailArchivePrecheck([], [])"), "\"not-in-inbox\"",
-                "precheck: no INBOX match does not act")
+        t.equal(pre("null", "[500]", "[]"), "\"unknown\"",
+                "precheck: failed lookup of the requested row aborts")
+        t.equal(pre("[500]", "null", "[]"), "\"unknown\"",
+                "precheck: failed INBOX fingerprint lookup aborts")
+
+        // Watermark: only copies created after the run started are ours.
+        t.equal(evalJS("newCopies([480, 501, 502], 500)"), "[501,502]",
+                "watermark: copies at or below the watermark are pre-existing")
+        t.equal(evalJS("newCopies([500], 500)"), "[]", "watermark: equal to the watermark is pre-existing")
+        t.equal(evalJS("newCopies(null, 500)"), "null", "watermark: failed lookup stays failed")
+        t.equal(evalJS("newCopies([501], undefined)"), "null", "watermark: no watermark fails closed")
+
+        // Outcome: OK only when this run saw the Trash copy arrive, refiled it,
+        // and the result is a single All Mail copy created by the refile.
+        func outcome(_ arrived: Bool, _ refiled: Bool, _ state: String) -> String {
+            evalJS("gmailArchiveOutcome({arrived: \(arrived), refiled: \(refiled), wm: 500, state: \(state)})")
+        }
+        t.equal(outcome(true, true, "{inbox: [], allMail: [502], trash: []}"), "\"archived\"",
+                "outcome: arrival seen, refiled, new All Mail copy only is archived")
+        t.equal(outcome(false, false, "{inbox: [], allMail: [500], trash: []}"), "\"unknown\"",
+                "outcome: INBOX gone + All Mail present without a seen Trash arrival is unknown, not OK")
+        t.equal(outcome(true, false, "{inbox: [], allMail: [502], trash: []}"), "\"unknown\"",
+                "outcome: no refile performed is unknown")
+        t.equal(outcome(true, true, "{inbox: [], allMail: [500], trash: []}"), "\"unknown\"",
+                "outcome: the only All Mail copy predates the run (refile not landed) is unknown")
+        t.equal(outcome(true, true, "{inbox: [], allMail: [502], trash: [501]}"), "\"ambiguous\"",
+                "outcome: Trash copy still listed after refile is ambiguous")
+        t.equal(outcome(true, true, "{inbox: [], allMail: [], trash: [501]}"), "\"trash\"",
+                "outcome: refile did not take is left in Trash")
+        t.equal(outcome(true, true, "{inbox: [500], allMail: [500], trash: []}"), "\"inbox\"",
+                "outcome: still in INBOX is still in INBOX")
         t.check(js.exception == nil, "gmail criterion: JS evaluated without exceptions")
 
         // Swift side: a Gmail job without a Date in the index is refused up front.
-        t.check(mailArchiveRefusal(gmail: true, dateSent: nil) != nil,
+        t.check(mailArchiveRefusal(gmail: true, dateSent: nil, watermark: 60_000) != nil,
                 "refusal: Gmail job with no Date is refused")
-        t.check(mailArchiveRefusal(gmail: true, dateSent: -5) != nil,
+        t.check(mailArchiveRefusal(gmail: true, dateSent: -5, watermark: 60_000) != nil,
                 "refusal: Gmail job with a negative Date is refused")
-        t.check(mailArchiveRefusal(gmail: true, dateSent: 1_795_000_000) == nil,
+        t.check(mailArchiveRefusal(gmail: true, dateSent: 1_795_000_000, watermark: 60_000) == nil,
                 "refusal: Gmail job with a Date proceeds")
-        t.check(mailArchiveRefusal(gmail: false, dateSent: nil) == nil,
+        t.check(mailArchiveRefusal(gmail: false, dateSent: nil, watermark: 60_000) == nil,
                 "refusal: standard IMAP job does not need a Date")
+        t.check(mailArchiveRefusal(gmail: true, dateSent: 1_795_000_000, watermark: nil) != nil,
+                "refusal: Gmail job without an index watermark is refused")
+        t.check(mailArchiveRefusal(gmail: false, dateSent: nil, watermark: nil) == nil,
+                "refusal: standard IMAP job does not need a watermark")
         t.equal(MailArchiveStatus(token: "OK"), .ok, "status: OK token is success")
         t.equal(MailArchiveStatus(token: "AMBIGUOUS"), .ambiguous, "status: AMBIGUOUS is its own status")
         t.equal(MailArchiveStatus(token: "UNKNOWN"), .unknown, "status: UNKNOWN is its own status")
@@ -411,12 +450,13 @@ struct SelfTestCommand: ParsableCommand {
         // parse; JXA would otherwise fail every archive at run time. Parse only:
         // the script is wrapped in a function that is never called.
         let parser = JSContext()!
-        let script = mailArchiveScript(jobsJSON: "[]", scriptBudget: 80)
+        let script = mailArchiveScript(jobsJSON: "[]", scriptBudget: 80, watermark: 60_000)
         parser.evaluateScript("var parsed = typeof (function () {\n" + script + "\n; return run; })")
         t.check(parser.exception == nil,
                 "mail_archive script parses (\(parser.exception?.toString() ?? "ok"))")
         t.check(script.contains("function gmailArchiveVerdict(") && script.contains("function fingerprintFilter(")
-                    && script.contains("function gmailArchivePrecheck("),
+                    && script.contains("function gmailArchivePrecheck(")
+                    && script.contains("function gmailArchiveOutcome(") && script.contains("function newCopies("),
                 "mail_archive script embeds the tested criterion")
 
         try t.finish()
