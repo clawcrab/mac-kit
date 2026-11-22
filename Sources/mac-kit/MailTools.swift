@@ -395,6 +395,19 @@ struct MailStore {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Largest messages.ROWID right now: the watermark mail_archive uses to
+    /// tell copies Mail.app creates during a run from ones that existed before.
+    func maxMessageRowID() throws -> Int64? {
+        try db.query("SELECT MAX(ROWID) FROM messages").first?.first?.intValue
+    }
+
+    /// The message's Date header as epoch seconds (messages.date_sent), the
+    /// second half of the fingerprint mail_archive matches Gmail copies by.
+    func dateSent(id: Int64) throws -> Int64? {
+        try db.query("SELECT date_sent FROM messages WHERE ROWID = ? LIMIT 1", [.int(id)])
+            .first?.first?.intValue
+    }
+
     /// The mailbox a message should be archived into for its account:
     /// "Archive" for standard IMAP (iCloud, custom domains), "All Mail" for
     /// Gmail-style accounts (moving there drops the INBOX label). Nil when the
@@ -1093,80 +1106,387 @@ func mailSendText(to: String, subject: String, body: String,
 // messageId`. All lookups iterate account.mailboxes by name rather than using
 // `by name` specifiers, which return broken references for Gmail mailboxes.
 
-/// Move any messages Mail.app quarantined into a "Recovered Messages (<acct>)"
-/// mailbox back into All Mail, and report which message-ids were found there.
-///
-/// This runs as its own short process, on purpose. The archive script does the
-/// same sweep at the end of each job, but a script that gets killed at the
-/// timeout never reaches its own ending — on 2026-08-03 three messages were
-/// stranded exactly that way, the morning after the in-script sweep was added.
-/// A repair step is only worth having where the failure it repairs cannot also
-/// prevent it from running.
-///
-/// Deliberately small: one whose-clause lookup per id per Recovered mailbox,
-/// no polling, no settle loops. It has to finish.
-private func sweepRecoveredMessages(messageIDs: [String]) -> Set<String> {
-    guard !messageIDs.isEmpty else { return [] }
-    let json = String(
-        decoding: (try? JSONSerialization.data(withJSONObject: messageIDs)) ?? Data(), as: UTF8.self)
-    let source = """
+/// The JXA archive script. Split out so self-test can check it parses.
+func mailArchiveScript(jobsJSON json: String, scriptBudget: Int, watermark: Int64) -> String {
+    return """
     function run() {
       const Mail = Application('Mail');
-      const ids = JSON.parse(\(jsLiteral(json)));
-      let allmail = null;
-      const accts = Mail.accounts;
-      for (let a = 0; a < accts.length && !allmail; a++) {
-        const boxes = accts[a].mailboxes;
-        for (let b = 0; b < boxes.length; b++) {
-          try { if (String(boxes[b].name()) === 'All Mail') { allmail = boxes[b]; break; } } catch (e) {}
+      const jobs = JSON.parse(\(jsLiteral(json)));
+      // The caller kills this script at a hard cap. Everything below that
+      // is optional waiting must yield before then, or the run dies with
+      // no per-id results at all — and, worse, dies *before* the cleanup
+      // that puts stranded mail back (2026-08-02: a single job burned the
+      // whole 90s and left a message sitting in "Recovered Messages").
+      const T0 = Date.now();
+      const BUDGET_MS = \(scriptBudget) * 1000;
+      // Envelope Index max ROWID before this run. Mail.app ids are ROWIDs and
+      // only grow, so copies at or below it predate the run (see newCopies).
+      const WM = \(watermark);
+      function msLeft() { return BUDGET_MS - (Date.now() - T0); }
+      function mbxByName(account, wanted) {
+        const boxes = account.mailboxes;
+        for (let i = 0; i < boxes.length; i++) {
+          try { if (String(boxes[i].name()) === wanted) return boxes[i]; } catch (e) {}
+        }
+        return null;
+      }
+      function acctByName(name) {
+        const accts = Mail.accounts;
+        for (let i = 0; i < accts.length; i++) {
+          try { if (String(accts[i].name()) === name) return accts[i]; } catch (e) {}
+        }
+        return null;
+      }
+      function hits(mbx, mid) {
+        if (!mbx) return -1;
+        try { return mbx.messages.whose({messageId: mid}).length; } catch (e) { return -1; }
+      }
+      // Gmail exposes no X-GM-MSGID to Mail.app's scripting model or
+      // headers, so a message is identified by its fingerprint: the
+      // Message-ID AND the Date header (fingerprintFilter). Message-ID alone
+      // is not unique: senders reuse it across distinct mails, and Gmail
+      // keeps them all. Fails closed: null when any Date is unreadable.
+      function matching(mbx, job) {
+        if (!mbx) return null;
+        try {
+          const found = mbx.messages.whose({messageId: job.mid});
+          const msgs = [], cands = [];
+          for (let i = 0; i < found.length; i++) {
+            let sec = null;
+            try { sec = Math.floor(found[i].dateSent().getTime() / 1000); } catch (e) {}
+            msgs.push(found[i]);
+            cands.push({ id: Number(found[i].id()), ds: (sec === null || isNaN(sec)) ? null : sec });
+          }
+          const ids = fingerprintFilter(cands, job.ds);
+          if (ids === null) return null;
+          return msgs.filter((m, i) => ids.indexOf(cands[i].id) >= 0);
+        } catch (e) { return null; }
+      }
+      // Mail.app ids of the matching copies (null when the lookup failed).
+      function observe(mbx, job) {
+        const m = matching(mbx, job);
+        if (m === null) return null;
+        try { return m.map(x => Number(x.id())); } catch (e) { return null; }
+      }
+      \(gmailArchiveCriterionJS)
+      // A Trash->All Mail refile can half-complete: the server-side move
+      // happens but Mail.app quarantines its local copy into an
+      // application-level "Recovered Messages (<acct>)" mailbox (seen
+      // 2026-07-19, issue #4). Whose-clause lookup works there where plain
+      // iteration throws -1728; a move out of it refiles cleanly.
+      // Only the job's own account's quarantine, only copies Mail.app created
+      // during this run (id above the watermark), only an exact single
+      // fingerprint match; the caller re-runs the verdict afterwards, so a
+      // rescue never counts as success by itself.
+      function rescueRecovered(job, allmail) {
+        try {
+          const wanted = 'Recovered Messages (' + job.account + ')';
+          const boxes = Mail.mailboxes;
+          for (let i = 0; i < boxes.length; i++) {
+            let nm = '';
+            try { nm = String(boxes[i].name()); } catch (e) {}
+            if (nm !== wanted) continue;
+            const found = matching(boxes[i], job);
+            if (found === null) continue;
+            const fresh = found.filter(m => Number(m.id()) > WM);
+            if (fresh.length === 1) { Mail.move(fresh[0], {to: allmail}); return true; }
+          }
+        } catch (e) {}
+        return false;
+      }
+      const out = [];
+      for (const job of jobs) {
+        try {
+          const acct = acctByName(job.account);
+          if (!acct) { out.push(job.id + '\\tERR\\tno account named "' + job.account + '"'); continue; }
+          const inbox = mbxByName(acct, 'INBOX');
+          if (!inbox) { out.push(job.id + '\\tERR\\tno INBOX mailbox on account'); continue; }
+
+          if (job.gmail === '1') {
+            // Gmail: remove the INBOX label via delete (-> Trash) then refile
+            // Trash -> All Mail. Both are real IMAP moves that stick.
+            //
+            // Every lookup below goes through observe(), which matches the
+            // job's fingerprint (Message-ID + Date header), not the
+            // Message-ID alone: some senders reuse a Message-ID across
+            // distinct mails, and Gmail can hold several of them. The verdict
+            // comes from gmailArchiveVerdict() (gmailArchiveCriterionJS, unit-tested
+            // by self-test), which asks "is the target state reached?"
+            // rather than "is the symptom gone?".
+            const allmail = mbxByName(acct, 'All Mail');
+            const trash = mbxByName(acct, 'Trash');
+            if (!allmail) { out.push(job.id + '\\tERR\\tno All Mail mailbox on Gmail account'); continue; }
+            if (!trash) { out.push(job.id + '\\tERR\\tno Trash mailbox on Gmail account'); continue; }
+            function state() {
+              return { inbox: observe(inbox, job), allMail: observe(allmail, job), trash: observe(trash, job) };
+            }
+            function describe(s) {
+              const f = a => a === null ? '?' : (a.length + (a.length ? ' [' + a.join(',') + ']' : ''));
+              return '(inbox=' + f(s.inbox) + ' allMail=' + f(s.allMail) + ' trash=' + f(s.trash) + ')';
+            }
+            // Statuses the caller can tell apart: OK only for 'archived';
+            // AMBIGUOUS and UNKNOWN are neither success nor a known failure.
+            function emitVerdict(v, s, prefix) {
+              if (v === 'ambiguous') {
+                const where = (s.allMail.length > 0 && s.trash.length > 0)
+                  ? 'copies found in both All Mail and Trash (All Mail ids ' + s.allMail.join(',') + '; Trash ids ' + s.trash.join(',') + ')'
+                  : 'several matching copies in one mailbox ' + describe(s);
+                out.push(job.id + '\\tAMBIGUOUS\\t' + prefix + where + "; Mail.app's local index may be stale; check in Gmail");
+              } else if (v === 'unknown') {
+                out.push(job.id + '\\tUNKNOWN\\t' + prefix + 'a mailbox lookup (or a Date) could not be read — state unknown, check in Gmail before retrying ' + describe(s));
+              } else if (v === 'inbox') {
+                out.push(job.id + '\\tERR\\t' + prefix + 'still in INBOX ' + describe(s));
+              } else if (v === 'trash') {
+                out.push(job.id + '\\tERR\\t' + prefix + 'left in Trash, not refiled to All Mail — recover from Gmail Trash ' + describe(s));
+              } else {
+                out.push(job.id + '\\tERR\\t' + prefix + 'not in INBOX, All Mail, or Trash — state unknown, check "Recovered Messages" in Mail.app ' + describe(s));
+              }
+            }
+            // Only the caller's exact row is ever deleted: look it up in INBOX
+            // by its id (Mail.app ids are Envelope Index ROWIDs; an INBOX hit
+            // is the All Mail row carrying the INBOX label). The fingerprint
+            // only verifies it. gmailArchivePrecheck decides whether to act.
+            let requested = null;
+            try {
+              const h = inbox.messages.whose({id: Number(job.id)});
+              requested = [];
+              for (let i = 0; i < h.length; i++) requested.push(h[i]);
+            } catch (e) { requested = null; }
+            const inboxFp = observe(inbox, job);
+            const preTrash = observe(trash, job);
+            const pre = gmailArchivePrecheck({
+              id: Number(job.id), inbox: inboxFp, preTrash: preTrash,
+              requested: requested === null ? null : requested.map(m => Number(m.id()))
+            });
+            if (pre === 'unknown') { out.push(job.id + '\\\tUNKNOWN\\\tcould not read INBOX/Trash for this message (or its Date) — nothing was changed'); continue; }
+            if (pre === 'not-in-inbox') { out.push(job.id + '\\\tERR\\\tthe requested message is not in INBOX — nothing was changed'); continue; }
+            if (pre === 'mismatch') { out.push(job.id + '\\\tUNKNOWN\\\tthe requested message does not match its own Message-ID + Date fingerprint in INBOX — nothing was changed'); continue; }
+            if (pre === 'ambiguous') { out.push(job.id + '\\\tAMBIGUOUS\\\tbefore archiving: another INBOX copy with the same fingerprint, or a Trash copy already present (inbox ids ' + inboxFp.join(',') + '; trash ids ' + preTrash.join(',') + "); Mail.app's local index may be stale; nothing was changed, check in Gmail"); continue; }
+
+            // A Trash copy only counts as the arrival of THIS delete if Mail.app
+            // created it after the run started (id above the watermark).
+            function newTrashCopy() {
+              const ids = newCopies(observe(trash, job), WM);
+              if (ids === null || ids.length !== 1) return null;
+              try { const h = trash.messages.whose({id: ids[0]}); return h.length === 1 ? h[0] : null; } catch (e) { return null; }
+            }
+            Mail.delete(requested[0]);               // drops INBOX label, lands in Trash
+            // Mail.delete() settles asynchronously: the message can take
+            // seconds to become visible in Trash (large messages / busy
+            // sync are slower). Poll two windows for the arrival. In Gmail an
+            // INBOX message is always in All Mail too, so "INBOX gone + All
+            // Mail present" is NOT evidence of anything: without a seen
+            // arrival and a refile, the result is UNKNOWN, never OK.
+            let trashMsg = null;
+            for (let attempt = 0; attempt < 40 && trashMsg === null; attempt++) {
+              trashMsg = newTrashCopy();
+              if (trashMsg === null) delay(0.5);
+            }
+            if (trashMsg === null) {
+              const s0 = state();
+              out.push(job.id + '\\\tUNKNOWN\\\tdeleted from INBOX, but no new Trash copy was seen within 20s, so nothing was refiled — state unknown, check in Gmail before retrying ' + describe(s0));
+              continue;
+            }
+            const arrived = true;
+            Mail.move(trashMsg, {to: allmail});    // drops Trash label -> archived in All Mail
+            const refiled = true;
+            function outcomeOf(st) { return gmailArchiveOutcome({ arrived: arrived, refiled: refiled, wm: WM, state: st }); }
+            // the refile settles asynchronously too — wait for it to stick
+            let s = state();
+            for (let attempt = 0; attempt < 20 && outcomeOf(s) !== 'archived'; attempt++) {
+              delay(0.5);
+              s = state();
+            }
+            // Sweep Recovered Messages BEFORE the optional extended wait.
+            // A half-completed refile quarantines the local copy here, and
+            // this sweep is what undoes it — so it must not be the step
+            // that gets cut when time runs short.
+            let rescued = rescueRecovered(job, allmail);
+            if (rescued) s = state();
+            // 'ambiguous' here is usually Mail.app still holding the Trash
+            // copy it is about to drop, so it gets the same window.
+            const settling = v => v === 'trash' || v === 'ambiguous';
+            if (settling(outcomeOf(s))) {
+              // Refile didn't stick inside the settle budget. Give slow IMAP
+              // sync one extended window (the 7/19 incident reconciled itself
+              // ~a minute later), only if the remaining jobs can still report.
+              // Only Trash is re-read per tick (All Mail lookups are the
+              // slow ones); the full state is re-read once afterwards.
+              for (let attempt = 0; attempt < 20 && msLeft() > 15000; attempt++) {
+                delay(0.5);
+                s.trash = observe(trash, job);
+                if (!settling(outcomeOf(s))) break;
+              }
+              s = state();
+            }
+            rescued = rescueRecovered(job, allmail) || rescued;
+            if (rescued) s = state();
+            const v = outcomeOf(s);
+            if (v === 'archived') {
+              out.push(job.id + '\\\tOK\\\tarchived (INBOX label removed; refiled into All Mail' + (rescued ? '; rescued a stray local copy from Recovered Messages' : '') + ')');
+            } else {
+              // Anything but 'archived' is not success — including "absent
+              // from every place I looked" (34 messages were once reported
+              // archived that way, 2026-08-02) and copies in both All Mail
+              // and Trash (Mail.app's index is stale; neither claim holds).
+              emitVerdict(v, s, 'after archive: ');
+            }
+          } else {
+            // Standard IMAP: a real move INBOX -> Archive.
+            const dest = mbxByName(acct, job.target);
+            if (!dest) { out.push(job.id + '\\tERR\\tcannot resolve "' + job.target + '" mailbox'); continue; }
+            const found = inbox.messages.whose({messageId: job.mid});
+            if (found.length === 0) {
+              if (hits(dest, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (in ' + job.target + ')'); }
+              else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
+              continue;
+            }
+            Mail.move(found[0], {to: dest});
+            const inb = hits(inbox, job.mid);
+            if (inb === 0) { out.push(job.id + '\\tOK\\tmoved to ' + job.target); }
+            else { out.push(job.id + '\\tERR\\tstill in INBOX after move to ' + job.target + ' (inbox=' + inb + ')'); }
+          }
+        } catch (e) {
+          out.push(job.id + '\\tERR\\t' + e);
         }
       }
-      if (!allmail) return '';
-      const found = [];
-      const boxes = Mail.mailboxes;
-      for (let i = 0; i < boxes.length; i++) {
-        let nm = '';
-        try { nm = String(boxes[i].name()); } catch (e) { continue; }
-        if (nm.indexOf('Recovered') !== 0) continue;
-        for (let k = 0; k < ids.length; k++) {
-          try {
-            const hits = boxes[i].messages.whose({messageId: ids[k]});
-            if (hits.length > 0) { Mail.move(hits[0], {to: allmail}); found.push(ids[k]); }
-          } catch (e) {}
-        }
-      }
-      return found.join('\\n');
+      return out.join('\\n');
     }
     """
-    guard let raw = try? runJXA(source, timeout: 45) else { return [] }
-    return Set(raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty })
 }
+
+/// Per-message result of mail_archive. Only `.ok` is success. `.ambiguous`
+/// (Mail.app's local index contradicts itself, e.g. copies in both All Mail
+/// and Trash) and `.unknown` (a lookup failed, the message could not be
+/// identified, or the run timed out) are neither success nor a known failure.
+enum MailArchiveStatus: String {
+    case ok = "OK", error = "ERROR", ambiguous = "AMBIGUOUS", unknown = "UNKNOWN"
+
+    /// Status token on a line from the archive script.
+    init(token: String) {
+        switch token {
+        case "OK": self = .ok
+        case "AMBIGUOUS": self = .ambiguous
+        case "UNKNOWN": self = .unknown
+        default: self = .error
+        }
+    }
+}
+
+/// A Gmail job is refused before anything runs when its Date is missing from
+/// the index: without the Date the fingerprint degrades to Message-ID alone,
+/// which is not unique. Returns the refusal text, or nil to proceed.
+func mailArchiveRefusal(gmail: Bool, dateSent: Int64?, watermark: Int64?) -> String? {
+    guard gmail else { return nil }
+    guard watermark != nil else {
+        return "could not read the mail index watermark — cannot tell this run's copies from older ones, not touching it"
+    }
+    guard let ds = dateSent, ds >= 0 else {
+        return "no Date for this message in the index — cannot identify it reliably, not touching it"
+    }
+    return nil
+}
+
+/// The Gmail archive criterion, as JavaScript because the archive script runs
+/// it inside Mail.app's JXA; self-test runs this same source under
+/// JavaScriptCore.
+///
+/// - fingerprintFilter(cands, ds): a message is identified by Message-ID AND
+///   Date header (Gmail's X-GM-MSGID is not reachable from Mail.app). Takes
+///   the {id, ds} of the copies with the right Message-ID in one mailbox and
+///   returns the ids whose Date matches, or null — fail closed — when the
+///   target's or any candidate's Date is unreadable.
+/// - gmailArchivePrecheck(p): may we delete at all? Only the caller's exact
+///   row (p.requested = INBOX lookup by that row's id), only when it carries
+///   the fingerprint, is the sole INBOX match, and the Trash baseline was
+///   readable and empty (a Trash copy next to an INBOX one means the local
+///   index is already stale, and the archive could never end cleanly).
+/// - newCopies(ids, wm): the copies created after the run started. `wm` is
+///   the Envelope Index's max ROWID read before the script ran; ROWIDs only
+///   grow, so anything at or below it predates this run and is never touched.
+/// - gmailArchiveOutcome(o): success needs this run to have SEEN the new
+///   Trash copy arrive and refiled it, and the result to be a single All Mail
+///   copy created by that refile. In Gmail an INBOX message is always in All
+///   Mail too, so "INBOX gone + All Mail present" alone can be a delete that
+///   has not reached Trash yet: that is "unknown", never "archived".
+/// - gmailArchiveVerdict(s): has the message reached the target state — in
+///   All Mail, not in INBOX, not in Trash? A copy in both All Mail and Trash
+///   is "ambiguous": Gmail cannot hold one message in both, so Mail.app's
+///   local index is stale, and neither "archived" nor "left in Trash" can be
+///   claimed from it. Several matches in one mailbox is also "ambiguous". A
+///   failed lookup is "unknown". Only "archived" counts as success.
+let gmailArchiveCriterionJS = """
+function fingerprintFilter(cands, ds) {
+  if (typeof ds !== 'number' || ds < 0 || !cands) return null;
+  const out = [];
+  for (let i = 0; i < cands.length; i++) {
+    const c = cands[i];
+    if (typeof c.ds !== 'number') return null;
+    if (Math.abs(c.ds - ds) <= 1) out.push(c.id);
+  }
+  return out;
+}
+function gmailArchivePrecheck(p) {
+  if (!p || p.requested == null) return 'unknown';
+  if (p.requested.length === 0) return 'not-in-inbox';
+  if (p.requested.length !== 1 || p.requested[0] !== p.id) return 'unknown';
+  if (p.inbox == null || p.preTrash == null) return 'unknown';
+  if (p.inbox.indexOf(p.id) < 0) return 'mismatch';
+  if (p.inbox.length > 1) return 'ambiguous';
+  if (p.preTrash.length > 0) return 'ambiguous';
+  return 'proceed';
+}
+function newCopies(ids, wm) {
+  if (ids == null || typeof wm !== 'number') return null;
+  return ids.filter(function (x) { return x > wm; });
+}
+function gmailArchiveOutcome(o) {
+  if (!o || !o.arrived || !o.refiled) return 'unknown';
+  const v = gmailArchiveVerdict(o.state);
+  if (v !== 'archived') return v;
+  const fresh = newCopies(o.state.allMail, o.wm);
+  if (fresh == null || fresh.length !== 1) return 'unknown';
+  return 'archived';
+}
+function gmailArchiveVerdict(s) {
+  if (!s || s.inbox == null || s.allMail == null || s.trash == null) return 'unknown';
+  if (s.inbox.length > 1 || s.allMail.length > 1 || s.trash.length > 1) return 'ambiguous';
+  if (s.inbox.length > 0) return 'inbox';
+  if (s.allMail.length > 0 && s.trash.length > 0) return 'ambiguous';
+  if (s.allMail.length > 0) return 'archived';
+  return s.trash.length > 0 ? 'trash' : 'missing';
+}
+"""
 
 func mailArchiveText(ids: [Int64]) throws -> String {
     guard !ids.isEmpty else { throw ToolError("mail_archive requires at least one id") }
     let store = try MailStore()
 
-    struct Job { let id: Int64; let mid: String; let account: String; let target: String; let gmail: Bool }
-    struct Outcome { let id: Int64; let ok: Bool; let message: String }
+    struct Job { let id: Int64; let mid: String; let ds: Int64; let account: String; let target: String; let gmail: Bool }
+    struct Outcome { let id: Int64; let status: MailArchiveStatus; let message: String }
 
     var jobs: [Job] = []
     var results: [Int64: Outcome] = [:]
+    // Read before anything runs: every copy Mail.app creates from here on has
+    // a larger ROWID. Without it, Gmail jobs cannot tell their own Trash
+    // arrival from a pre-existing copy, so they are refused.
+    let watermark = try? store.maxMessageRowID()
 
     for id in ids {
         do {
             let detail = try store.messageDetail(id: id)
             guard let host = URL(string: detail.row.mailboxURL)?.host,
                   let account = store.accounts.first(where: { $0.uuid == host }) else {
-                results[id] = Outcome(id: id, ok: false, message: "cannot determine the account for this message")
+                results[id] = Outcome(id: id, status: .error, message: "cannot determine the account for this message")
                 continue
             }
             guard let mid = try store.messageIDHeader(id: id) else {
-                results[id] = Outcome(id: id, ok: false,
+                results[id] = Outcome(id: id, status: .error,
                     message: "no Message-ID in the index yet (message not fully synced)")
                 continue
             }
             guard let target = store.archiveTargetName(forAccountUUID: host) else {
-                results[id] = Outcome(id: id, ok: false,
+                results[id] = Outcome(id: id, status: .error,
                     message: "no Archive or All Mail mailbox for account \(account.name) — refusing to guess")
                 continue
             }
@@ -1175,16 +1495,21 @@ func mailArchiveText(ids: [Int64]) throws -> String {
             // plain move to All Mail is a server-side no-op, so those go through
             // the delete-then-refile path below.
             let gmail = store.isGmailAccount(uuid: host)
-            jobs.append(Job(id: id, mid: mid, account: account.name, target: target, gmail: gmail))
+            let ds = (try? store.dateSent(id: id)) ?? nil
+            if let refusal = mailArchiveRefusal(gmail: gmail, dateSent: ds, watermark: watermark) {
+                results[id] = Outcome(id: id, status: .unknown, message: refusal)
+                continue
+            }
+            jobs.append(Job(id: id, mid: mid, ds: ds ?? -1, account: account.name, target: target, gmail: gmail))
         } catch {
-            results[id] = Outcome(id: id, ok: false, message: "\(error)")
+            results[id] = Outcome(id: id, status: .error, message: "\(error)")
         }
     }
 
     if !jobs.isEmpty {
         let payload = jobs.map {
-            ["id": String($0.id), "mid": $0.mid, "account": $0.account,
-             "target": $0.target, "gmail": $0.gmail ? "1" : "0"]
+            ["id": String($0.id), "mid": $0.mid, "ds": $0.ds, "account": $0.account,
+             "target": $0.target, "gmail": $0.gmail ? "1" : "0"] as [String: Any]
         }
         let json = String(decoding: (try? JSONSerialization.data(withJSONObject: payload)) ?? Data(), as: UTF8.self)
         // Gmail jobs can poll up to ~40s each (3 × 10s settle loops — the
@@ -1197,193 +1522,13 @@ func mailArchiveText(ids: [Int64]) throws -> String {
         // The script gets told the cap so it can stop waiting and report,
         // rather than being killed with nothing to say. Give it a margin.
         let scriptBudget = Int(budget - 10)
-        let source = """
-        function run() {
-          const Mail = Application('Mail');
-          const jobs = JSON.parse(\(jsLiteral(json)));
-          // The caller kills this script at a hard cap. Everything below that
-          // is optional waiting must yield before then, or the run dies with
-          // no per-id results at all — and, worse, dies *before* the cleanup
-          // that puts stranded mail back (2026-08-02: a single job burned the
-          // whole 90s and left a message sitting in "Recovered Messages").
-          const T0 = Date.now();
-          const BUDGET_MS = \(scriptBudget) * 1000;
-          function msLeft() { return BUDGET_MS - (Date.now() - T0); }
-          function mbxByName(account, wanted) {
-            const boxes = account.mailboxes;
-            for (let i = 0; i < boxes.length; i++) {
-              try { if (String(boxes[i].name()) === wanted) return boxes[i]; } catch (e) {}
-            }
-            return null;
-          }
-          function acctByName(name) {
-            const accts = Mail.accounts;
-            for (let i = 0; i < accts.length; i++) {
-              try { if (String(accts[i].name()) === name) return accts[i]; } catch (e) {}
-            }
-            return null;
-          }
-          function hits(mbx, mid) {
-            if (!mbx) return -1;
-            try { return mbx.messages.whose({messageId: mid}).length; } catch (e) { return -1; }
-          }
-          // A Trash->All Mail refile can half-complete: the server-side move
-          // happens but Mail.app quarantines its local copy into an
-          // application-level "Recovered Messages (<acct>)" mailbox (seen
-          // 2026-07-19, issue #4). Whose-clause lookup works there where plain
-          // iteration throws -1728; a move out of it refiles cleanly.
-          function rescueRecovered(mid, allmail) {
-            try {
-              const boxes = Mail.mailboxes;
-              for (let i = 0; i < boxes.length; i++) {
-                let nm = '';
-                try { nm = String(boxes[i].name()); } catch (e) {}
-                if (nm.indexOf('Recovered') !== 0) continue;
-                const found = boxes[i].messages.whose({messageId: mid});
-                if (found.length > 0) { Mail.move(found[0], {to: allmail}); return true; }
-              }
-            } catch (e) {}
-            return false;
-          }
-          const out = [];
-          for (const job of jobs) {
-            try {
-              const acct = acctByName(job.account);
-              if (!acct) { out.push(job.id + '\\tERR\\tno account named "' + job.account + '"'); continue; }
-              const inbox = mbxByName(acct, 'INBOX');
-              if (!inbox) { out.push(job.id + '\\tERR\\tno INBOX mailbox on account'); continue; }
-
-              if (job.gmail === '1') {
-                // Gmail: remove the INBOX label via delete (-> Trash) then refile
-                // Trash -> All Mail. Both are real IMAP moves that stick.
-                const allmail = mbxByName(acct, 'All Mail');
-                const trash = mbxByName(acct, 'Trash');
-                if (!allmail) { out.push(job.id + '\\tERR\\tno All Mail mailbox on Gmail account'); continue; }
-                if (!trash) { out.push(job.id + '\\tERR\\tno Trash mailbox on Gmail account'); continue; }
-                const inInbox = inbox.messages.whose({messageId: job.mid});
-                if (inInbox.length === 0) {
-                  if (hits(trash, job.mid) > 0) { out.push(job.id + '\\tERR\\tnot in INBOX but still in Trash — an earlier archive stranded it; move it to All Mail by hand'); }
-                  else if (hits(allmail, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (not in INBOX; in All Mail)'); }
-                  else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
-                  continue;
-                }
-                Mail.delete(inInbox[0]);                 // drops INBOX label, lands in Trash
-                // Mail.delete() settles asynchronously: the message can take
-                // seconds to become visible in Trash (large messages / busy
-                // sync are slower). The old single-shot lookup here raced the
-                // move and stranded mail in Trash (2 real incidents, both
-                // image-heavy Starbucks sends). Poll instead of sampling once.
-                let trashMsg = null, reconciled = false;
-                for (let attempt = 0; attempt < 20; attempt++) {
-                  const t = trash.messages.whose({messageId: job.mid});
-                  if (t.length > 0) { trashMsg = t[0]; break; }
-                  delay(0.5);
-                }
-                // Only after the Trash poll budget expires may we conclude the
-                // label change reconciled straight to All Mail. Checking this
-                // INSIDE the poll loop would false-positive: Gmail mail always
-                // has an All Mail copy, so mid-flight (INBOX gone, Trash not
-                // yet visible) looks identical to reconciled-success.
-                if (trashMsg === null) {
-                  // Slow syncs can take longer than the Trash poll to settle
-                  // (10/3: two messages reported "state unknown" here and were
-                  // in All Mail moments later; 9/30: one was stranded in Trash).
-                  // "INBOX gone, All Mail yes, Trash no" is both the reconciled
-                  // state and the in-flight state, so never stop early on it:
-                  // watch a full second window for a late Trash arrival, and
-                  // only call it reconciled if Trash stayed empty throughout.
-                  for (let attempt = 0; attempt < 20; attempt++) {
-                    const lt = trash.messages.whose({messageId: job.mid});
-                    if (lt.length > 0) { trashMsg = lt[0]; break; }
-                    delay(0.5);
-                  }
-                  if (trashMsg === null) {
-                    if (hits(allmail, job.mid) > 0 && hits(inbox, job.mid) === 0 && hits(trash, job.mid) === 0) {
-                      reconciled = true;
-                    } else {
-                      out.push(job.id + '\\tERR\\tdeleted from INBOX but not visible in Trash or All Mail after 20s — state unknown, check Gmail before retrying');
-                      continue;
-                    }
-                  }
-                }
-                if (!reconciled) {
-                  Mail.move(trashMsg, {to: allmail});    // drops Trash label -> archived in All Mail
-                  // the refile settles asynchronously too — wait for it to stick
-                  for (let attempt = 0; attempt < 20; attempt++) {
-                    if (hits(trash, job.mid) === 0 && hits(allmail, job.mid) > 0) break;
-                    delay(0.5);
-                  }
-                }
-                let inb = hits(inbox, job.mid), am = hits(allmail, job.mid), tr = hits(trash, job.mid);
-                // Sweep Recovered Messages BEFORE the optional extended wait.
-                // A half-completed refile quarantines the local copy here, and
-                // this sweep is what undoes it — so it must not be the step
-                // that gets cut when time runs short. Running it twice is
-                // harmless: with nothing stranded it is one failed lookup.
-                let rescued = rescueRecovered(job.mid, allmail);
-                if (rescued) { am = hits(allmail, job.mid); tr = hits(trash, job.mid); }
-                if (tr > 0) {
-                  // Refile didn't stick inside the settle budget. Before
-                  // declaring a stuck state, give slow IMAP sync one extended
-                  // window — the 7/19 incident reconciled itself ~a minute
-                  // after the tool had already errored. Only spend that window
-                  // if there is time left for the remaining jobs to report.
-                  for (let attempt = 0; attempt < 20 && msLeft() > 15000; attempt++) {
-                    delay(0.5);
-                    tr = hits(trash, job.mid);
-                    if (tr === 0) break;
-                  }
-                  am = hits(allmail, job.mid);
-                  inb = hits(inbox, job.mid);
-                }
-                rescued = rescueRecovered(job.mid, allmail) || rescued;
-                if (rescued) { am = hits(allmail, job.mid); tr = hits(trash, job.mid); }
-                if (inb === 0 && am > 0 && tr === 0) {
-                  out.push(job.id + '\\tOK\\tarchived (INBOX label removed; in All Mail' + (rescued ? '; rescued a stray local copy from Recovered Messages' : '') + ')');
-                } else if (inb > 0) {
-                  out.push(job.id + '\\tERR\\tstill in INBOX after archive (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
-                } else if (tr > 0) {
-                  out.push(job.id + '\\tERR\\tleft in Trash, not refiled to All Mail — recover from Gmail Trash (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
-                } else {
-                  // Nowhere: gone from INBOX, but not in All Mail or Trash
-                  // either. This used to report OK, on the reasoning that
-                  // leaving the INBOX was the job. It isn't — archiving means
-                  // the message is IN All Mail, and "absent from the three
-                  // places I looked" is not that. Mail.app quarantines
-                  // half-refiled copies into "Recovered Messages (<acct>)",
-                  // which none of these counts cover, so a message could
-                  // vanish into it and still be reported archived. 34 of them
-                  // did, over two weeks, before anyone noticed (2026-08-02).
-                  out.push(job.id + '\\tERR\\tnot in INBOX, All Mail, or Trash — state unknown, check "Recovered Messages" in Mail.app (inbox=' + inb + ' allMail=' + am + ' trash=' + tr + ')');
-                }
-              } else {
-                // Standard IMAP: a real move INBOX -> Archive.
-                const dest = mbxByName(acct, job.target);
-                if (!dest) { out.push(job.id + '\\tERR\\tcannot resolve "' + job.target + '" mailbox'); continue; }
-                const found = inbox.messages.whose({messageId: job.mid});
-                if (found.length === 0) {
-                  if (hits(dest, job.mid) > 0) { out.push(job.id + '\\tOK\\talready archived (in ' + job.target + ')'); }
-                  else { out.push(job.id + '\\tERR\\tnot found in INBOX (already moved?)'); }
-                  continue;
-                }
-                Mail.move(found[0], {to: dest});
-                const inb = hits(inbox, job.mid);
-                if (inb === 0) { out.push(job.id + '\\tOK\\tmoved to ' + job.target); }
-                else { out.push(job.id + '\\tERR\\tstill in INBOX after move to ' + job.target + ' (inbox=' + inb + ')'); }
-              }
-            } catch (e) {
-              out.push(job.id + '\\tERR\\t' + e);
-            }
-          }
-          return out.join('\\n');
-        }
-        """
+        let source = mailArchiveScript(jobsJSON: json, scriptBudget: scriptBudget, watermark: watermark ?? -1)
         // A timeout kills the script outright, so nothing it was going to do
-        // afterwards happens — including the Recovered Messages sweep and the
-        // error it would have reported. Catch the throw, then run the sweep
-        // from here: a second, short-lived process that the dead one's clock
-        // cannot reach. Cleanup that lives inside the thing that can die is
-        // not cleanup.
+        // afterwards happens. Catch the throw and report the cut-off jobs as
+        // UNKNOWN. There used to be an out-of-process Recovered Messages
+        // sweep here that moved mail by Message-ID alone and reported the
+        // move itself as success; it is gone rather than patched — a
+        // timed-out job is reported as a timeout, never as archived.
         var raw = ""
         var timedOut = false
         do {
@@ -1394,36 +1539,29 @@ func mailArchiveText(ids: [Int64]) throws -> String {
         for line in raw.split(separator: "\n") {
             let parts = line.components(separatedBy: "\t")
             guard parts.count >= 3, let rid = Int64(parts[0]) else { continue }
-            results[rid] = Outcome(id: rid, ok: parts[1] == "OK",
+            results[rid] = Outcome(id: rid, status: MailArchiveStatus(token: parts[1]),
                                    message: parts[2...].joined(separator: "\t"))
         }
         // Jobs with no line back either never ran or were cut off mid-move.
-        // Either way the message may be sitting in the quarantine mailbox, so
-        // sweep before deciding what to say about them.
-        let unreported = jobs.filter { results[$0.id] == nil }
-        if !unreported.isEmpty {
-            let rescued = sweepRecoveredMessages(messageIDs: unreported.map { $0.mid })
-            for job in unreported {
-                if rescued.contains(job.mid) {
-                    results[job.id] = Outcome(
-                        id: job.id, ok: true,
-                        message: "archived (Mail.app stranded it in Recovered Messages; swept back to All Mail)")
-                } else {
-                    results[job.id] = Outcome(
-                        id: job.id, ok: false,
-                        message: timedOut
-                            ? "timed out with no result and nothing stranded — verify in Mail.app before retrying"
-                            : "no result returned from Mail.app")
-                }
-            }
+        for job in jobs where results[job.id] == nil {
+            results[job.id] = Outcome(
+                id: job.id, status: .unknown,
+                message: timedOut
+                    ? "timed out before Mail.app reported a result — state unknown; check INBOX, All Mail, Trash and \"Recovered Messages (\(job.account))\" before retrying"
+                    : "no result returned from Mail.app — state unknown")
         }
     }
 
-    let ordered = ids.map { results[$0] ?? Outcome(id: $0, ok: false, message: "no result") }
-    let okCount = ordered.filter { $0.ok }.count
-    var lines = ["Archived \(okCount) of \(ids.count) message(s):"]
+    let ordered = ids.map { results[$0] ?? Outcome(id: $0, status: .unknown, message: "no result") }
+    let okCount = ordered.filter { $0.status == .ok }.count
+    var header = "Archived \(okCount) of \(ids.count) message(s)"
+    let ambiguous = ordered.filter { $0.status == .ambiguous }.count
+    let unknown = ordered.filter { $0.status == .unknown }.count
+    if ambiguous > 0 { header += ", \(ambiguous) ambiguous" }
+    if unknown > 0 { header += ", \(unknown) unknown" }
+    var lines = [header + ":"]
     for outcome in ordered {
-        lines.append("  [\(outcome.id)] \(outcome.ok ? "OK" : "ERROR") — \(outcome.message)")
+        lines.append("  [\(outcome.id)] \(outcome.status.rawValue) — \(outcome.message)")
     }
     return lines.joined(separator: "\n")
 }
