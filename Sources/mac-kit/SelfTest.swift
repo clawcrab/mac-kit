@@ -571,53 +571,26 @@ struct SelfTestCommand: ParsableCommand {
         t.equal(sv([(0, st([500], [], []))], .notAttempted("refused")), .stillInRecovered,
                 "stable: a refused move needs one look only")
 
-        // Batch: the first UNKNOWN stops everything after it.
-        var batchCalls: [Int] = []
-        let batch = rescueRunBatch([1, 2, 3, 4]) { item -> (status: RescueStatus, message: String) in
-            batchCalls.append(item)
-            return item == 2 ? (.unknown, "timed out") : (.movedLocally, "fine")
+        // Requests: apply takes exactly one explicit id and nothing else;
+        // nonsense limits are refused, not adjusted.
+        func req(apply: Bool, id: Int64? = nil, since: String? = nil, subject: String? = nil,
+                 limit: Int? = nil) -> RescueRequest? {
+            try? rescueRequest(apply: apply, id: id, since: since, subject: subject, limit: limit)
         }
-        t.equal(batchCalls, [1, 2], "batch: nothing is attempted after the first UNKNOWN")
-        t.equal(batch.map { $0.status }, [.movedLocally, .unknown, .notAttempted, .notAttempted],
-                "batch: the rest are NOT_ATTEMPTED")
-        var allCalls = 0
-        let clean = rescueRunBatch([1, 2, 3]) { item -> (status: RescueStatus, message: String) in
-            allCalls += 1
-            return item == 1 ? (.stillInRecovered, "skipped") : (.movedLocally, "fine")
+        t.equal(req(apply: true, id: 500), .apply(id: 500), "request: apply with an id moves just that id")
+        t.equal(req(apply: true), nil, "request: apply without an id is rejected")
+        t.throwsError(matching: { $0.contains("explicit \"id\"") && $0.contains("nothing was moved") },
+                      "request: apply without an id says why") {
+            _ = try rescueRequest(apply: true, id: nil, since: nil, subject: nil, limit: nil)
         }
-        t.equal(allCalls, 3, "batch: STILL_IN_RECOVERED does not stop the batch")
-        t.check(!clean.contains { $0.status == .notAttempted }, "batch: no UNKNOWN, nothing marked NOT_ATTEMPTED")
-
-        // Overall deadline: never start an item that could run past the budget.
-        var clock: TimeInterval = 0
-        var timedCalls: [Int] = []
-        let timed = rescueRunBatch([1, 2, 3, 4, 5], budget: 150, perItemMax: 95, now: { clock }) {
-            item -> (status: RescueStatus, message: String) in
-            timedCalls.append(item)
-            clock += 40
-            return (.movedLocally, "fine")
-        }
-        t.equal(timedCalls, [1, 2], "deadline: an item that could end past 150s is not started")
-        t.equal(timed.map { $0.status }, [.movedLocally, .movedLocally, .notAttempted, .notAttempted, .notAttempted],
-                "deadline: everything not started is NOT_ATTEMPTED")
-        clock = 0
-        var fastCalls = 0
-        _ = rescueRunBatch([1, 2, 3, 4, 5], budget: 150, perItemMax: 95, now: { clock }) {
-            _ -> (status: RescueStatus, message: String) in
-            fastCalls += 1
-            clock += 8
-            return (.movedLocally, "fine")
-        }
-        t.equal(fastCalls, 5, "deadline: quick moves all fit in the budget")
-
-        // Batch size cap.
-        t.equal(rescueEffectiveLimit(50, apply: true).limit, 5, "limit: apply clamps 50 to 5")
-        t.check(rescueEffectiveLimit(50, apply: true).note?.contains("clamped to 5") == true,
-                "limit: clamping is noted in the output")
-        t.equal(rescueEffectiveLimit(3, apply: true).limit, 3, "limit: apply keeps a limit under the cap")
-        t.check(rescueEffectiveLimit(5, apply: true).note == nil, "limit: no note at the cap")
-        t.equal(rescueEffectiveLimit(50, apply: false).limit, 50, "limit: the dry run may list more")
-        t.equal(rescueEffectiveLimit(0, apply: true).limit, 1, "limit: nonsense limits become 1")
+        t.equal(req(apply: true, id: 500, limit: 5), nil, "request: apply refuses a limit (no batches)")
+        t.equal(req(apply: true, id: 500, since: "2026-11-01"), nil, "request: apply refuses since")
+        t.equal(req(apply: true, id: 500, subject: "x"), nil, "request: apply refuses subject")
+        t.equal(req(apply: false), .list(id: nil, since: nil, subject: nil, limit: 50), "request: dry run lists 50 by default")
+        t.equal(req(apply: false, since: "2026-11-01", subject: "x", limit: 3),
+                .list(id: nil, since: "2026-11-01", subject: "x", limit: 3), "request: dry run keeps its filters")
+        t.equal(req(apply: false, limit: 0), nil, "request: limit 0 is refused, not turned into 1")
+        t.equal(req(apply: false, limit: -2), nil, "request: negative limit is refused")
 
         // Local-only claim: the status name and message say so.
         t.equal(RescueStatus.movedLocally.rawValue, "MOVED_LOCALLY", "status: success is named MOVED_LOCALLY")
@@ -633,13 +606,22 @@ struct SelfTestCommand: ParsableCommand {
         if sqlite3_open(fixture, &writer) == SQLITE_OK {
             sqlite3_exec(writer, """
                 CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, mailbox INTEGER,
-                                       date_sent INTEGER, deleted INTEGER);
-                INSERT INTO messages VALUES (500, 77, 23, 1000, 0);
-                INSERT INTO messages VALUES (601, 77, 15, 1001, 0);
-                INSERT INTO messages VALUES (602, 77, 15, 1000, 1);
-                INSERT INTO messages VALUES (603, 77, 21, 5000, 0);
-                INSERT INTO messages VALUES (604, 77, 16, 1000, 0);
-                INSERT INTO messages VALUES (605, 88, 15, 1000, 0);
+                                       date_sent INTEGER, deleted INTEGER, subject INTEGER,
+                                       sender INTEGER, date_received INTEGER);
+                CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+                CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+                CREATE TABLE message_global_data (message_id INTEGER, message_id_header TEXT);
+                INSERT INTO subjects VALUES (1, 'Cruise deals');
+                INSERT INTO addresses VALUES (1, 'a@example.com', 'A');
+                INSERT INTO message_global_data VALUES (77, '<m77@example.com>');
+                INSERT INTO message_global_data VALUES (99, '<m99@example.com>');
+                INSERT INTO messages VALUES (500, 77, 23, 1000, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (510, 99, 23, 3000, 0, 1, 1, 4000);
+                INSERT INTO messages VALUES (601, 77, 15, 1001, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (602, 77, 15, 1000, 1, 1, 1, 2000);
+                INSERT INTO messages VALUES (603, 77, 21, 5000, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (604, 77, 16, 1000, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (605, 88, 15, 1000, 0, 1, 1, 2000);
                 """, nil, nil, nil)
         }
         sqlite3_close(writer)
@@ -651,6 +633,14 @@ struct SelfTestCommand: ParsableCommand {
             t.equal(fixtureDB.queryCount - before, 1, "snapshot: one observation runs exactly one statement")
             t.equal(observed, st([500], [601], []),
                     "snapshot: rows split per mailbox (deleted All Mail copy, other Date, INBOX and other Message-IDs ignored)")
+            // apply's lookup: only the named row, only from Recovered.
+            let named = (try? rescueRecoveredRows(db: fixtureDB, box: 23, id: 500, limit: 1)) ?? []
+            t.equal(named.map { $0.id }, [500], "apply lookup: returns only the named Recovered row")
+            t.equal(named.first?.header, "m77@example.com", "apply lookup: carries its Message-ID")
+            t.equal(((try? rescueRecoveredRows(db: fixtureDB, box: 23, id: 601, limit: 1)) ?? []).count, 0,
+                    "apply lookup: an id outside Recovered is not found")
+            t.equal(((try? rescueRecoveredRows(db: fixtureDB, box: 23, limit: 50)) ?? []).map { $0.id }, [510, 500],
+                    "dry run lookup: lists every Recovered row, newest first")
         } else {
             t.check(false, "snapshot: fixture index could not be opened")
         }

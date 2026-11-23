@@ -335,14 +335,15 @@ struct MCPServer {
         ],
         [
             "name": "mail_rescue_recovered",
-            "description": "List messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout) and, with apply: true, move them back to [Gmail]/All Mail one at a time. Default is a DRY RUN that moves nothing. Never deletes; never touches INBOX or Trash. The result is judged from Mail.app's LOCAL index afterwards (Message-ID + Date fingerprint, one-query snapshots): per message MOVED_LOCALLY (gone from Recovered, exactly one new All Mail copy, nothing in Trash — the same state on two looks at least 5s apart), STILL_IN_RECOVERED, UNKNOWN (including any timed-out move or a state that did not settle within 30s), or NOT_ATTEMPTED. MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it. apply moves at most 5 messages per run (larger limits are clamped), stops at the first UNKNOWN, and has a 150s overall deadline.",
+            "description": "Gmail messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout). Default is a DRY RUN that moves nothing: lists the messages (optional since/subject/limit/id filters) with id, date, subject and whether each is eligible to move, with the reason if not. apply: true moves EXACTLY ONE message — the one named by \"id\" — back to [Gmail]/All Mail; apply without an id is rejected, and since/subject/limit are not accepted with apply. Never deletes; never touches INBOX, Trash or any other message. The result is judged from Mail.app's LOCAL index (Message-ID + Date fingerprint, one-query snapshots): MOVED_LOCALLY (gone from Recovered, exactly one new All Mail copy, nothing in Trash — the same state on two looks at least 5s apart), STILL_IN_RECOVERED (with the reason), or UNKNOWN (including a timed-out move or a state that did not settle within 30s). MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "since": ["type": "string", "description": "Optional ISO date; only messages received on/after it, e.g. \"2026-11-01\""],
-                    "subject": ["type": "string", "description": "Optional case-insensitive substring the subject must contain"],
-                    "limit": ["type": "integer", "description": "Max messages to list (default 50); apply moves at most 5 per run and clamps larger values"],
-                    "apply": ["type": "boolean", "description": "true to actually move the listed messages back to All Mail (default false = dry run)"]
+                    "id": ["type": "integer", "description": "Message id from the dry run. Required with apply: true (the one message to move); in a dry run, lists just that message"],
+                    "apply": ["type": "boolean", "description": "true to move the one message named by id (default false = dry run)"],
+                    "since": ["type": "string", "description": "Dry run only: messages received on/after this ISO date, e.g. \"2026-11-01\""],
+                    "subject": ["type": "string", "description": "Dry run only: case-insensitive substring the subject must contain"],
+                    "limit": ["type": "integer", "description": "Dry run only: max messages to list (default 50, must be at least 1)"]
                 ]
             ]
         ]
@@ -571,10 +572,11 @@ struct MCPServer {
                 text = try mailArchiveText(ids: ids)
             case "mail_rescue_recovered":
                 text = try mailRescueRecoveredText(
+                    apply: (args["apply"] as? Bool) ?? false,
+                    id: (args["id"] as? NSNumber)?.int64Value,
                     since: args["since"] as? String,
                     subject: args["subject"] as? String,
-                    limit: (args["limit"] as? NSNumber)?.intValue ?? 50,
-                    apply: (args["apply"] as? Bool) ?? false
+                    limit: (args["limit"] as? NSNumber)?.intValue
                 )
             default:
                 throw ToolError("Unknown tool: \(name)")

@@ -15,7 +15,8 @@ import Foundation
 //     Mail.app call, and only the caller-visible row (Mail.app id == Envelope
 //     Index ROWID) that carries the message's fingerprint;
 //   • it never deletes, never touches INBOX or Trash;
-//   • the default is a dry run that lists what is there and what would happen.
+//   • the default is a dry run that lists what is there and what would happen;
+//     apply moves exactly one message, named by its id.
 //
 // The verdict is about Mail.app's LOCAL state only: MOVED_LOCALLY means the
 // local index shows the message in All Mail, which does not prove the Gmail
@@ -35,9 +36,8 @@ import Foundation
 // the index says. Each observation is ONE SQL statement over all three
 // mailboxes, so it is a single snapshot of the index.
 //
-// Bounded runs: apply touches at most 5 messages, stops at the first UNKNOWN,
-// and never starts a message that could run past a 150s overall deadline;
-// whatever is left is NOT_ATTEMPTED.
+// No batches: apply takes exactly one explicit id and moves only that row.
+// The dry run is how you find the ids (and which ones are eligible).
 //
 // Source and destination are pinned to the identities the index check uses:
 // the Mail.app account by id (== the UUID in the index's mailbox URL), All
@@ -69,7 +69,6 @@ enum RescueStatus: String {
     case movedLocally = "MOVED_LOCALLY"
     case stillInRecovered = "STILL_IN_RECOVERED"
     case unknown = "UNKNOWN"
-    case notAttempted = "NOT_ATTEMPTED"   // batch stopped before this message
 }
 
 /// What the Mail.app move call reported. Only `.moved` can lead to MOVED_LOCALLY.
@@ -187,51 +186,6 @@ func rescueStableVerdict(rowID: Int64, watermark: Int64, move: RescueMove,
         return (.unknown, "index had not settled: \(prev.state.summary) then \(last.state.summary) — state unknown")
     }
     return verdict
-}
-
-/// Most messages one apply run will touch; larger limits are clamped.
-let rescueMaxBatch = 5
-/// Overall deadline for one apply run.
-let rescueBatchBudget: TimeInterval = 150
-/// Worst case for one message: the 60s move-call timeout + 30s settle + slack.
-let rescuePerItemMax: TimeInterval = 95
-
-/// apply is capped at rescueMaxBatch messages per run (the dry run may list
-/// more). Returns the limit to use and, when clamped, the note to print.
-func rescueEffectiveLimit(_ limit: Int, apply: Bool) -> (limit: Int, note: String?) {
-    let wanted = max(1, limit)
-    guard apply, wanted > rescueMaxBatch else { return (wanted, nil) }
-    return (rescueMaxBatch, "limit \(limit) clamped to \(rescueMaxBatch) — apply moves at most \(rescueMaxBatch) messages per run")
-}
-
-/// Run `body` for each item in order. Stops the whole batch at the first
-/// UNKNOWN (a timeout included), and never starts an item unless it could
-/// finish inside `budget` (elapsed + `perItemMax`). Everything not started
-/// is NOT_ATTEMPTED and `body` is never called for it. `now` is seconds on
-/// any monotonic clock (injected so self-test can drive it).
-func rescueRunBatch<T>(_ items: [T], budget: TimeInterval = rescueBatchBudget,
-                       perItemMax: TimeInterval = rescuePerItemMax,
-                       now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-                       _ body: (T) -> (status: RescueStatus, message: String))
-    -> [(status: RescueStatus, message: String)] {
-    let start = now()
-    var results: [(status: RescueStatus, message: String)] = []
-    var stopReason: String?
-    for item in items {
-        if stopReason == nil && now() - start + perItemMax > budget {
-            stopReason = "not attempted — the run's \(Int(budget))s deadline would be exceeded; run again for the rest"
-        }
-        if let stopReason {
-            results.append((.notAttempted, stopReason))
-            continue
-        }
-        let result = body(item)
-        results.append(result)
-        if result.status == .unknown {
-            stopReason = "not attempted — the batch stopped at an earlier UNKNOWN; re-run the dry run first"
-        }
-    }
-    return results
 }
 
 /// JXA-side pick: of the Recovered copies with the right Message-ID, the one
@@ -390,46 +344,53 @@ extension MailStore {
         return RescueBoxes(recovered: recovered[0], allMail: allMail[0], trash: trash[0],
                            accountUUID: account.uuid, allMailPath: rescueAllMailPath)
     }
+}
 
-    func recoveredRows(box: Int64, since: Int64?, subject: String?, limit: Int) throws -> [RescueRow] {
-        var sql = """
-        SELECT m.ROWID, m.message_id, g.message_id_header, m.date_sent, m.date_received,
-               s.subject, COALESCE(a.address, ''), COALESCE(a.comment, '')
-        FROM messages m
-        JOIN subjects s ON s.ROWID = m.subject
-        LEFT JOIN addresses a ON a.ROWID = m.sender
-        LEFT JOIN message_global_data g ON g.message_id = m.message_id
-        WHERE m.mailbox = ? AND m.deleted = 0
-        """
-        var bindings: [ReadOnlyDB.Value] = [.int(box)]
-        if let since {
-            sql += " AND m.date_received >= ?"
-            bindings.append(.int(since))
-        }
-        if let subject, !subject.isEmpty {
-            let escaped = subject
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "%", with: "\\%")
-                .replacingOccurrences(of: "_", with: "\\_")
-            sql += " AND s.subject LIKE ? ESCAPE '\\'"
-            bindings.append(.text("%\(escaped)%"))
-        }
-        sql += " ORDER BY m.date_received DESC LIMIT \(max(1, limit))"
-        return try db.query(sql, bindings).map { row in
-            let header = row[2].stringValue?
-                .trimmingCharacters(in: CharacterSet(charactersIn: "<> \t\r\n"))
-            return RescueRow(
-                id: row[0].intValue ?? 0,
-                messageHash: row[1].intValue ?? 0,
-                header: (header?.isEmpty ?? true) ? nil : header,
-                dateSent: row[3].intValue,
-                dateReceived: row[4].intValue ?? 0,
-                subject: row[5].stringValue ?? "",
-                sender: Self.formatAddress(address: row[6].stringValue ?? "", name: row[7].stringValue ?? "")
-            )
-        }
+/// Rows in the Recovered mailbox `box`, newest first. `id` restricts to that
+/// one row (apply never looks at any other); `since`/`subject` are dry-run
+/// filters.
+func rescueRecoveredRows(db: ReadOnlyDB, box: Int64, id: Int64? = nil, since: Int64? = nil,
+                         subject: String? = nil, limit: Int) throws -> [MailStore.RescueRow] {
+    var sql = """
+    SELECT m.ROWID, m.message_id, g.message_id_header, m.date_sent, m.date_received,
+           s.subject, COALESCE(a.address, ''), COALESCE(a.comment, '')
+    FROM messages m
+    JOIN subjects s ON s.ROWID = m.subject
+    LEFT JOIN addresses a ON a.ROWID = m.sender
+    LEFT JOIN message_global_data g ON g.message_id = m.message_id
+    WHERE m.mailbox = ? AND m.deleted = 0
+    """
+    var bindings: [ReadOnlyDB.Value] = [.int(box)]
+    if let id {
+        sql += " AND m.ROWID = ?"
+        bindings.append(.int(id))
     }
-
+    if let since {
+        sql += " AND m.date_received >= ?"
+        bindings.append(.int(since))
+    }
+    if let subject, !subject.isEmpty {
+        let escaped = subject
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        sql += " AND s.subject LIKE ? ESCAPE '\\'"
+        bindings.append(.text("%\(escaped)%"))
+    }
+    sql += " ORDER BY m.date_received DESC LIMIT \(limit)"
+    return try db.query(sql, bindings).map { row in
+        let header = row[2].stringValue?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "<> \t\r\n"))
+        return MailStore.RescueRow(
+            id: row[0].intValue ?? 0,
+            messageHash: row[1].intValue ?? 0,
+            header: (header?.isEmpty ?? true) ? nil : header,
+            dateSent: row[3].intValue,
+            dateReceived: row[4].intValue ?? 0,
+            subject: row[5].stringValue ?? "",
+            sender: MailStore.formatAddress(address: row[6].stringValue ?? "", name: row[7].stringValue ?? "")
+        )
+    }
 }
 
 /// The one statement an observation runs: every copy with this message's
@@ -482,98 +443,113 @@ extension MailStore {
 
 // MARK: Tool
 
-func mailRescueRecoveredText(since: String?, subject: String?, limit: Int, apply: Bool,
-                             settleSeconds: Double = 30) throws -> String {
+/// What one call asks for. apply takes exactly one explicit id and none of
+/// the dry-run filters; nonsense limits are refused rather than adjusted.
+enum RescueRequest: Equatable {
+    case list(id: Int64?, since: String?, subject: String?, limit: Int)
+    case apply(id: Int64)
+}
+
+func rescueRequest(apply: Bool, id: Int64?, since: String?, subject: String?,
+                   limit: Int?) throws -> RescueRequest {
+    if apply {
+        guard let id else {
+            throw ToolError("mail_rescue_recovered apply: true needs an explicit \"id\" — it moves exactly one message. "
+                + "Run it without apply first to list the ids and see which are eligible; nothing was moved")
+        }
+        guard since == nil, subject == nil, limit == nil else {
+            throw ToolError("mail_rescue_recovered apply: true takes only \"id\" — since/subject/limit are dry-run filters; nothing was moved")
+        }
+        return .apply(id: id)
+    }
+    let wanted = limit ?? 50
+    guard wanted >= 1 else { throw ToolError("mail_rescue_recovered \"limit\" must be at least 1") }
+    return .list(id: id, since: since, subject: subject, limit: wanted)
+}
+
+func mailRescueRecoveredText(apply: Bool, id: Int64?, since: String?, subject: String?,
+                             limit: Int?, settleSeconds: Double = 30) throws -> String {
+    let request = try rescueRequest(apply: apply, id: id, since: since, subject: subject, limit: limit)
     let store = try MailStore()
     let boxes = try store.rescueBoxes()
-    let sinceEpoch = try since.map { try parseSinceDate($0) }
-    let (effectiveLimit, clamp) = rescueEffectiveLimit(limit, apply: apply)
-    let clampNote = clamp.map { "\nNote: \($0)" } ?? ""
-    let rows = try store.recoveredRows(box: boxes.recovered, since: sinceEpoch, subject: subject, limit: effectiveLimit)
-
-    var filters: [String] = []
-    if let since { filters.append("since \(since)") }
-    if let subject, !subject.isEmpty { filters.append("subject contains \"\(subject)\"") }
-    let filterText = filters.isEmpty ? "" : " (" + filters.joined(separator: ", ") + ")"
-
-    if rows.isEmpty {
-        return "No messages in \(rescueRecoveredMailboxName)\(filterText)."
-    }
     func label(_ row: MailStore.RescueRow) -> String {
         "\(formatEpoch(row.dateReceived))  \(row.subject.isEmpty ? "(no subject)" : row.subject)  — \(row.sender)"
     }
 
-    if !apply {
+    switch request {
+    case .list(let id, let since, let subject, let limit):
+        let sinceEpoch = try since.map { try parseSinceDate($0) }
+        let rows = try rescueRecoveredRows(db: store.db, box: boxes.recovered, id: id, since: sinceEpoch,
+                                           subject: subject, limit: limit)
+        var filters: [String] = []
+        if let id { filters.append("id \(id)") }
+        if let since { filters.append("since \(since)") }
+        if let subject, !subject.isEmpty { filters.append("subject contains \"\(subject)\"") }
+        let filterText = filters.isEmpty ? "" : " (" + filters.joined(separator: ", ") + ")"
+        if rows.isEmpty { return "No messages in \(rescueRecoveredMailboxName)\(filterText)." }
         let watermark = try? store.maxMessageRowID()
-        var lines = ["DRY RUN — nothing moved. \(rows.count) message(s) in \(rescueRecoveredMailboxName)\(filterText); "
-                     + "pass apply: true to move them back to [Gmail]/All Mail one at a time "
-                     + "(at most \(rescueMaxBatch) per run):"]
+        var lines = ["DRY RUN — nothing moved. \(rows.count) message(s) in \(rescueRecoveredMailboxName)\(filterText). "
+                     + "To move one back to [Gmail]/All Mail, call again with apply: true and its id:"]
         for row in rows {
             let state = store.rescueState(row, boxes: boxes)
             let plan = rescuePrecheck(rowID: row.id, dateSent: row.dateSent, watermark: watermark, state: state)
-                .map { "would SKIP: \($0)" } ?? "would move to All Mail"
+                .map { "not eligible: \($0)" } ?? "eligible"
             lines.append("  [\(row.id)] \(label(row))")
             lines.append("      \(plan)")
         }
         return lines.joined(separator: "\n")
+
+    case .apply(let id):
+        guard let row = try rescueRecoveredRows(db: store.db, box: boxes.recovered, id: id, limit: 1).first else {
+            throw ToolError("No message [\(id)] in \(rescueRecoveredMailboxName) — nothing was moved; run the dry run to list the ids")
+        }
+        let result = rescueApplyOne(row, store: store, boxes: boxes, settleSeconds: settleSeconds)
+        return [
+            "[\(row.id)] \(result.status.rawValue) — \(result.message)",
+            "    \(label(row))",
+            "MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it."
+        ].joined(separator: "\n")
+    }
+}
+
+/// Move one Recovered row to All Mail and judge the local end state.
+private func rescueApplyOne(_ row: MailStore.RescueRow, store: MailStore, boxes: MailStore.RescueBoxes,
+                            settleSeconds: Double) -> (status: RescueStatus, message: String) {
+    let watermark = try? store.maxMessageRowID()
+    let before = store.rescueState(row, boxes: boxes)
+    if let refusal = rescuePrecheck(rowID: row.id, dateSent: row.dateSent, watermark: watermark, state: before) {
+        return rescueVerdict(rowID: row.id, watermark: watermark ?? Int64.max,
+                             move: .notAttempted(refusal), state: before)
+    }
+    guard let wm = watermark, let mid = row.header, let ds = row.dateSent else {
+        return (.stillInRecovered, "not moved: no Message-ID in the index")
+    }
+    let job: [String: Any] = ["id": row.id, "mid": mid, "ds": ds,
+                              "accountId": boxes.accountUUID, "allMailPath": boxes.allMailPath,
+                              "recovered": rescueRecoveredMailboxName]
+    let json = String(decoding: (try? JSONSerialization.data(withJSONObject: job)) ?? Data(), as: UTF8.self)
+
+    let move: RescueMove
+    do {
+        move = rescueMove(fromScriptOutput: try runJXA(mailRescueScript(jobJSON: json), timeout: 60))
+    } catch {
+        move = .indeterminate("the Mail.app move call failed or timed out (\(error))")
     }
 
-    // One message at a time; the first UNKNOWN (a timeout included) or the
-    // overall deadline stops the batch — the rest are NOT_ATTEMPTED.
-    let results = rescueRunBatch(rows) { row -> (status: RescueStatus, message: String) in
-        // Re-read everything right before acting on this row: earlier moves
-        // in the same run bump the watermark and may have changed the index.
-        let watermark = try? store.maxMessageRowID()
-        let before = store.rescueState(row, boxes: boxes)
-        if let refusal = rescuePrecheck(rowID: row.id, dateSent: row.dateSent, watermark: watermark, state: before) {
-            return rescueVerdict(rowID: row.id, watermark: watermark ?? Int64.max,
-                                 move: .notAttempted(refusal), state: before)
+    // The index settles asynchronously (and passed through an All Mail +
+    // Trash state on 2026-11-23). Observe every rescueStableGap seconds;
+    // stop early only once MOVED_LOCALLY is confirmed by two identical
+    // observations, otherwise judge whatever the 30s window leaves.
+    let started = Date()
+    var observations = [(at: TimeInterval(0), state: store.rescueState(row, boxes: boxes))]
+    if move == .moved {
+        while Date().timeIntervalSince(started) + rescueStableGap <= settleSeconds {
+            if rescueStableVerdict(rowID: row.id, watermark: wm, move: move,
+                                   observations: observations).status == .movedLocally { break }
+            Thread.sleep(forTimeInterval: rescueStableGap)
+            observations.append((at: Date().timeIntervalSince(started),
+                                 state: store.rescueState(row, boxes: boxes)))
         }
-        guard let wm = watermark, let mid = row.header, let ds = row.dateSent else {
-            return (.stillInRecovered, "not moved: no Message-ID in the index")
-        }
-        let job: [String: Any] = ["id": row.id, "mid": mid, "ds": ds,
-                                  "accountId": boxes.accountUUID, "allMailPath": boxes.allMailPath,
-                                  "recovered": rescueRecoveredMailboxName]
-        let json = String(decoding: (try? JSONSerialization.data(withJSONObject: job)) ?? Data(), as: UTF8.self)
-
-        let move: RescueMove
-        do {
-            move = rescueMove(fromScriptOutput: try runJXA(mailRescueScript(jobJSON: json), timeout: 60))
-        } catch {
-            move = .indeterminate("the Mail.app move call failed or timed out (\(error))")
-        }
-
-        // The index settles asynchronously (and passed through an All Mail +
-        // Trash state on 2026-11-23). Observe every rescueStableGap seconds;
-        // stop early only once MOVED_LOCALLY is confirmed by two identical observations,
-        // otherwise judge whatever the deadline leaves.
-        let started = Date()
-        var observations = [(at: TimeInterval(0), state: store.rescueState(row, boxes: boxes))]
-        if move == .moved {
-            while Date().timeIntervalSince(started) + rescueStableGap <= settleSeconds {
-                if rescueStableVerdict(rowID: row.id, watermark: wm, move: move,
-                                       observations: observations).status == .movedLocally { break }
-                Thread.sleep(forTimeInterval: rescueStableGap)
-                observations.append((at: Date().timeIntervalSince(started),
-                                     state: store.rescueState(row, boxes: boxes)))
-            }
-        }
-        return rescueStableVerdict(rowID: row.id, watermark: wm, move: move, observations: observations)
     }
-    let outcomes = zip(rows, results).map { (row: $0, status: $1.status, message: $1.message) }
-
-    let moved = outcomes.filter { $0.status == .movedLocally }.count
-    let still = outcomes.filter { $0.status == .stillInRecovered }.count
-    let unknown = outcomes.filter { $0.status == .unknown }.count
-    let skipped = outcomes.filter { $0.status == .notAttempted }.count
-    var lines = ["\(moved) of \(outcomes.count) message(s) MOVED_LOCALLY from \(rescueRecoveredMailboxName) to All Mail"
-                 + "\(filterText): \(still) still in Recovered, \(unknown) unknown, \(skipped) not attempted.\(clampNote)",
-                 "MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it.",
-                 "Only MOVED_LOCALLY is a completed move:"]
-    for outcome in outcomes {
-        lines.append("  [\(outcome.row.id)] \(outcome.status.rawValue) — \(outcome.message)")
-        lines.append("      \(label(outcome.row))")
-    }
-    return lines.joined(separator: "\n")
+    return rescueStableVerdict(rowID: row.id, watermark: wm, move: move, observations: observations)
 }
