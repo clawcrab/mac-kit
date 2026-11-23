@@ -185,7 +185,7 @@ struct MailCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mail",
         abstract: "Read Apple Mail's local index (read-only) and send via Mail.app.",
-        subcommands: [MailUnread.self, MailSearch.self, MailRead.self, MailSend.self, MailArchive.self]
+        subcommands: [MailUnread.self, MailSearch.self, MailRead.self, MailSend.self, MailArchive.self, MailRescueRecovered.self]
     )
 }
 
@@ -200,6 +200,29 @@ struct MailArchive: ParsableCommand {
 
     func run() throws {
         print(try mailArchiveText(ids: ids))
+    }
+}
+
+struct MailRescueRecovered: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "rescue-recovered",
+        abstract: "List mail in \"Recovered Messages (Google)\"; with --apply, move it back to All Mail (dry run by default)."
+    )
+
+    @Option(help: "Only messages received on/after this ISO date")
+    var since: String?
+
+    @Option(help: "Only messages whose subject contains this text")
+    var subject: String?
+
+    @Option(help: "Max messages")
+    var limit: Int = 50
+
+    @Flag(help: "Actually move the messages (default: dry run, nothing moved)")
+    var apply = false
+
+    func run() throws {
+        print(try mailRescueRecoveredText(since: since, subject: subject, limit: limit, apply: apply))
     }
 }
 

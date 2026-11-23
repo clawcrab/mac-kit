@@ -332,6 +332,19 @@ struct MCPServer {
                     ]
                 ]
             ]
+        ],
+        [
+            "name": "mail_rescue_recovered",
+            "description": "List messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout) and, with apply: true, move them back to [Gmail]/All Mail one at a time. Default is a DRY RUN that moves nothing. Never deletes; never touches INBOX or Trash. Success is judged from the mail index afterwards (Message-ID + Date fingerprint): per message OK (gone from Recovered, exactly one new All Mail copy, nothing in Trash), STILL_IN_RECOVERED, or UNKNOWN (including any timed-out move). Only OK is success.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "since": ["type": "string", "description": "Optional ISO date; only messages received on/after it, e.g. \"2026-11-01\""],
+                    "subject": ["type": "string", "description": "Optional case-insensitive substring the subject must contain"],
+                    "limit": ["type": "integer", "description": "Max messages to list/move (default 50)"],
+                    "apply": ["type": "boolean", "description": "true to actually move the listed messages back to All Mail (default false = dry run)"]
+                ]
+            ]
         ]
     ]
 
@@ -556,6 +569,13 @@ struct MCPServer {
                     throw ToolError("mail_archive requires \"id\" or \"ids\" (message ids from mail_search/mail_unread)")
                 }
                 text = try mailArchiveText(ids: ids)
+            case "mail_rescue_recovered":
+                text = try mailRescueRecoveredText(
+                    since: args["since"] as? String,
+                    subject: args["subject"] as? String,
+                    limit: (args["limit"] as? NSNumber)?.intValue ?? 50,
+                    apply: (args["apply"] as? Bool) ?? false
+                )
             default:
                 throw ToolError("Unknown tool: \(name)")
             }

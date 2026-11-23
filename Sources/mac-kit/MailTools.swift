@@ -85,7 +85,7 @@ final class ReadOnlyDB {
     }
 }
 
-private extension ReadOnlyDB.Value {
+extension ReadOnlyDB.Value {
     var stringValue: String? {
         switch self {
         case .text(let string): return string
@@ -695,7 +695,7 @@ private let mailDateFormatter: DateFormatter = {
     return formatter
 }()
 
-private func formatEpoch(_ epoch: Int64) -> String {
+func formatEpoch(_ epoch: Int64) -> String {
     guard epoch > 0 else { return "?" }
     return mailDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
 }
@@ -711,7 +711,7 @@ private func formatRow(_ row: MailStore.MessageRow, store: MailStore, index: Int
     """
 }
 
-private func parseSinceDate(_ since: String) throws -> Int64 {
+func parseSinceDate(_ since: String) throws -> Int64 {
     let iso = ISO8601DateFormatter()
     if let date = iso.date(from: since) {
         return Int64(date.timeIntervalSince1970)

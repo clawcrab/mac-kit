@@ -459,6 +459,106 @@ struct SelfTestCommand: ParsableCommand {
                     && script.contains("function gmailArchiveOutcome(") && script.contains("function newCopies("),
                 "mail_archive script embeds the tested criterion")
 
+        // MARK: mail_rescue_recovered (end state in the index, not the move call)
+        //
+        // State arguments are fingerprint-matching ROWIDs per mailbox. Row 500
+        // sits in Recovered; the watermark is 600, so a copy created by the
+        // move has a ROWID above 600.
+
+        func st(_ recovered: [Int64]?, _ allMail: [Int64]?, _ trash: [Int64]?) -> RescueState {
+            RescueState(recovered: recovered, allMail: allMail, trash: trash)
+        }
+        func rv(_ move: RescueMove, _ state: RescueState) -> RescueStatus {
+            rescueVerdict(rowID: 500, watermark: 600, move: move, state: state).status
+        }
+        t.equal(rv(.moved, st([], [601], [])), .ok,
+                "rescue: gone from Recovered, one new All Mail copy, no Trash is OK")
+        t.equal(rv(.moved, st([500], [], [])), .stillInRecovered,
+                "rescue: move returned but still in Recovered is STILL_IN_RECOVERED")
+        t.equal(rv(.moved, st([], [601], [602])), .unknown,
+                "rescue: All Mail + Trash copy (the 50747/50748 state) is not OK")
+        t.equal(rv(.moved, st([], [], [])), .unknown,
+                "rescue: vanished from Recovered but not in All Mail is not OK")
+        t.equal(rv(.moved, st([], [], [601])), .unknown,
+                "rescue: landed in Trash only is not OK")
+        t.equal(rv(.moved, st([500], [601], [])), .unknown,
+                "rescue: copies in both Recovered and All Mail is unknown")
+        t.equal(rv(.moved, st([], [601, 602], [])), .unknown,
+                "rescue: two new All Mail copies is not OK")
+        t.equal(rv(.moved, st([], [480], [])), .unknown,
+                "rescue: an All Mail copy that predates the run is not proof of the move")
+        t.equal(rv(.moved, st([], [480, 601], [])), .unknown,
+                "rescue: old + new All Mail copies is not OK")
+        t.equal(rv(.moved, st(nil, [601], [])), .unknown, "rescue: failed Recovered lookup is unknown")
+        t.equal(rv(.moved, st([], nil, [])), .unknown, "rescue: failed All Mail lookup is unknown")
+        t.equal(rv(.moved, st([], [601], nil)), .unknown, "rescue: failed Trash lookup is unknown")
+        t.equal(rv(.indeterminate("osascript timed out"), st([], [601], [])), .unknown,
+                "rescue: a timed-out move is UNKNOWN even when the index looks done")
+        t.equal(rv(.indeterminate("Mail.move raised"), st([500], [], [])), .unknown,
+                "rescue: a move that threw is UNKNOWN even when still in Recovered")
+        t.equal(rv(.notAttempted("refused"), st([500], [], [])), .stillInRecovered,
+                "rescue: refused before moving and unchanged is STILL_IN_RECOVERED")
+        t.equal(rv(.notAttempted("already in All Mail"), st([500], [480], [])), .stillInRecovered,
+                "rescue: refused because already in All Mail stays STILL_IN_RECOVERED")
+        t.equal(rv(.notAttempted("refused"), st([], [601], [])), .unknown,
+                "rescue: not attempted can never be OK")
+        t.equal(rv(.notAttempted("refused"), st(nil, nil, nil)), .unknown,
+                "rescue: not attempted with unreadable state is unknown")
+
+        // Pre-check: only the sole fingerprint match in Recovered, nothing in
+        // All Mail or Trash yet, with a watermark and a Date.
+        func rp(_ state: RescueState, ds: Int64? = 1_795_000_000, wm: Int64? = 600) -> Bool {
+            rescuePrecheck(rowID: 500, dateSent: ds, watermark: wm, state: state) == nil
+        }
+        t.check(rp(st([500], [], [])), "rescue precheck: sole Recovered copy proceeds")
+        t.check(!rp(st([500], [480], [])), "rescue precheck: already in All Mail is not moved (no duplicate)")
+        t.check(!rp(st([500], [], [480])), "rescue precheck: a Trash copy already present refuses")
+        t.check(!rp(st([500, 501], [], [])), "rescue precheck: two Recovered fingerprint matches refuse")
+        t.check(!rp(st([501], [], [])), "rescue precheck: row without its own fingerprint refuses")
+        t.check(!rp(st([500], nil, [])), "rescue precheck: failed lookup refuses")
+        t.check(!rp(st([500], [], []), ds: nil), "rescue precheck: no Date refuses")
+        t.check(!rp(st([500], [], []), wm: nil), "rescue precheck: no watermark refuses")
+
+        // Script reply parsing: only a clean MOVED is a completed move.
+        t.equal(rescueMove(fromScriptOutput: "MOVED"), .moved, "rescue reply: MOVED")
+        t.equal(rescueMove(fromScriptOutput: "SKIP\tnone"), .notAttempted("none"), "rescue reply: SKIP is not attempted")
+        t.check(rescueMove(fromScriptOutput: "ERRMOVE\t-1728") != .moved, "rescue reply: ERRMOVE is not a move")
+        t.check(rescueMove(fromScriptOutput: "") != .moved, "rescue reply: empty is not a move")
+        t.check(rescueMove(fromScriptOutput: "MOVED?") != .moved, "rescue reply: garbage is not a move")
+
+        // Swift fingerprint twin agrees with the JS one on the same vectors.
+        let fpVectors: [([(id: Int64, ds: Int64?)], Int64?)] = [
+            ([(1, 1000), (2, 5000)], 1000), ([(1, 1001)], 1000), ([(1, 1002)], 1000),
+            ([(1, 1000), (2, nil)], 1000), ([(1, 1000)], -1), ([(1, 1000)], nil), ([], 1000)
+        ]
+        for (index, vector) in fpVectors.enumerated() {
+            let swiftResult = mailFingerprintFilter(vector.0, ds: vector.1)
+            let swiftJSON = swiftResult.map { "[" + $0.map(String.init).joined(separator: ",") + "]" } ?? "null"
+            let candsJS = "[" + vector.0.map { "{id: \($0.id), ds: \($0.ds.map(String.init) ?? "null")}" }
+                .joined(separator: ",") + "]"
+            t.equal(swiftJSON, evalJS("fingerprintFilter(\(candsJS), \(vector.1.map(String.init) ?? "null"))"),
+                    "fingerprint: Swift and JS agree on vector \(index)")
+        }
+
+        // JXA pick inside Recovered.
+        js.evaluateScript(rescuePickJS)
+        t.equal(evalJS("rescuePick([{id: 500, ds: 1000}], 1000, 500)"), "\"ok\"", "rescue pick: sole match is the row")
+        t.equal(evalJS("rescuePick([{id: 501, ds: 1000}], 1000, 500)"), "\"mismatch\"", "rescue pick: other row refuses")
+        t.equal(evalJS("rescuePick([{id: 500, ds: 1000}, {id: 501, ds: 1000}], 1000, 500)"), "\"ambiguous\"",
+                "rescue pick: two matches refuse")
+        t.equal(evalJS("rescuePick([{id: 500, ds: 9000}], 1000, 500)"), "\"none\"", "rescue pick: wrong Date refuses")
+        t.equal(evalJS("rescuePick([{id: 500, ds: null}], 1000, 500)"), "\"unknown\"", "rescue pick: unreadable Date refuses")
+
+        let rescueScript = mailRescueScript(jobJSON: "{}")
+        let rescueParser = JSContext()!
+        rescueParser.evaluateScript("var parsed = typeof (function () {\n" + rescueScript + "\n; return run; })")
+        t.check(rescueParser.exception == nil,
+                "mail_rescue_recovered script parses (\(rescueParser.exception?.toString() ?? "ok"))")
+        t.check(rescueScript.contains("function rescuePick(") && rescueScript.contains("function fingerprintFilter("),
+                "mail_rescue_recovered script embeds the tested pick")
+        t.check(!rescueScript.contains("Mail.delete") && !rescueScript.contains(".delete("),
+                "mail_rescue_recovered script never deletes")
+
         try t.finish()
     }
 }
