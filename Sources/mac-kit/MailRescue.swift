@@ -24,11 +24,21 @@ import Foundation
 // this run (ROWID above the watermark), with no copy in Trash. Observed
 // 2026-11-23: right after a manual move the index briefly listed both an All
 // Mail and a Trash copy (50747/50748) before settling on All Mail alone, so
-// the end state is polled for a while; if it has not settled, the answer is
-// UNKNOWN. A timed-out or failed move call is UNKNOWN whatever the index says.
+// the end state is re-read every 5s and only counts once two consecutive
+// looks, at least 5s apart, show the identical state; anything not settled
+// within 30s is UNKNOWN. A timed-out or failed move call is UNKNOWN whatever
+// the index says, and the first UNKNOWN stops the batch (the rest are
+// NOT_ATTEMPTED).
+//
+// Source and destination are pinned to the identities the index check uses:
+// the Mail.app account by id (== the UUID in the index's mailbox URL), All
+// Mail by its full path "[Gmail]/All Mail", the quarantine by exact name —
+// each must match exactly once on both sides, or nothing is moved.
 
 let rescueAccountName = "Google"
 let rescueRecoveredMailboxName = "Recovered Messages (\(rescueAccountName))"
+let rescueAllMailPath = "[Gmail]/All Mail"
+let rescueTrashPath = "[Gmail]/Trash"
 
 /// Swift twin of `fingerprintFilter` in gmailArchiveCriterionJS (self-test
 /// cross-checks the two on the same vectors so they cannot drift): the ids of
@@ -48,6 +58,7 @@ enum RescueStatus: String {
     case ok = "OK"
     case stillInRecovered = "STILL_IN_RECOVERED"
     case unknown = "UNKNOWN"
+    case notAttempted = "NOT_ATTEMPTED"   // batch stopped before this message
 }
 
 /// What the Mail.app move call reported. Only `.moved` can lead to OK.
@@ -140,6 +151,52 @@ func rescueVerdict(rowID: Int64, watermark: Int64, move: RescueMove,
     return (.ok, "now in All Mail as [\(newAllMail[0])]")
 }
 
+/// Minimum gap between the two observations that confirm an end state.
+let rescueStableGap: TimeInterval = 5
+
+/// The verdict over a sequence of index observations taken after the move
+/// (`at` = seconds since the move). The index passes through transient
+/// states (All Mail + Trash on 2026-11-23), so after a completed move a
+/// verdict only stands when the LAST TWO observations show the identical
+/// state at least `rescueStableGap` apart; a state seen once, or one that
+/// changed, is UNKNOWN. Moves that did not complete are judged on the last
+/// observation alone (they are never OK anyway).
+func rescueStableVerdict(rowID: Int64, watermark: Int64, move: RescueMove,
+                         observations: [(at: TimeInterval, state: RescueState)]) -> (status: RescueStatus, message: String) {
+    guard let last = observations.last else {
+        return (.unknown, "the index was never read after the move — state unknown")
+    }
+    let verdict = rescueVerdict(rowID: rowID, watermark: watermark, move: move, state: last.state)
+    guard move == .moved, verdict.status != .unknown else { return verdict }
+    guard observations.count >= 2 else {
+        return (.unknown, "\(verdict.status.rawValue) state seen only once, not confirmed — state unknown \(last.state.summary)")
+    }
+    let prev = observations[observations.count - 2]
+    guard prev.state == last.state, last.at - prev.at >= rescueStableGap else {
+        return (.unknown, "index had not settled: \(prev.state.summary) then \(last.state.summary) — state unknown")
+    }
+    return verdict
+}
+
+/// Run `body` for each item in order, stopping the whole batch at the first
+/// UNKNOWN (a timeout included): the rest are reported NOT_ATTEMPTED and
+/// `body` is never called for them.
+func rescueRunBatch<T>(_ items: [T], _ body: (T) -> (status: RescueStatus, message: String))
+    -> [(status: RescueStatus, message: String)] {
+    var results: [(status: RescueStatus, message: String)] = []
+    var stopped = false
+    for item in items {
+        if stopped {
+            results.append((.notAttempted, "not attempted — the batch stopped at an earlier UNKNOWN; re-run the dry run first"))
+            continue
+        }
+        let result = body(item)
+        results.append(result)
+        if result.status == .unknown { stopped = true }
+    }
+    return results
+}
+
 /// JXA-side pick: of the Recovered copies with the right Message-ID, the one
 /// to move must be the requested row and the only fingerprint match.
 let rescuePickJS = """
@@ -162,26 +219,51 @@ func mailRescueScript(jobJSON json: String) -> String {
       \(gmailArchiveCriterionJS)
       \(rescuePickJS)
       let target = null, allmail = null;
+      // "[Gmail]/All Mail": the mailbox name prefixed by its parent folders
+      // (Gmail's "[Gmail]" folder has class 'container'), the same path the
+      // Envelope Index URL carries.
+      function fullPath(m) {
+        const parts = [String(m.name())];
+        let c = m;
+        for (let d = 0; d < 8; d++) {
+          let p, cls = '';
+          try { p = c.container(); cls = String(p.properties().pcls); } catch (e) { break; }
+          if (cls !== 'mailbox' && cls !== 'container') break;
+          parts.unshift(String(p.name()));
+          c = p;
+        }
+        return parts.join('/');
+      }
       try {
+        // Source and destination are pinned to the identities the index
+        // check uses: the account by its id (== the UUID in the index's
+        // mailbox URL), All Mail by full path, the quarantine by exact
+        // name. Each must match exactly once, or nothing is moved.
         // The quarantine is an application-level mailbox; whose-clause
         // lookups work there where plain message iteration throws -1728.
         const boxes = Mail.mailboxes;
-        let rec = null;
-        for (let i = 0; i < boxes.length && rec === null; i++) {
-          try { if (String(boxes[i].name()) === job.recovered) rec = boxes[i]; } catch (e) {}
+        const recs = [];
+        for (let i = 0; i < boxes.length; i++) {
+          let nm = null;
+          try { nm = String(boxes[i].name()); } catch (e) {}
+          if (nm === null) return 'SKIP\\tcould not read an application mailbox name';
+          if (nm === job.recovered) recs.push(boxes[i]);
         }
-        if (rec === null) return 'SKIP\\tno mailbox named "' + job.recovered + '" in Mail.app';
-        const accts = Mail.accounts;
-        let acct = null;
-        for (let i = 0; i < accts.length && acct === null; i++) {
-          try { if (String(accts[i].name()) === job.account) acct = accts[i]; } catch (e) {}
-        }
-        if (acct === null) return 'SKIP\\tno account named "' + job.account + '"';
+        if (recs.length !== 1) return 'SKIP\\t' + recs.length + ' application mailboxes named "' + job.recovered + '" (need exactly 1)';
+        const rec = recs[0];
+        const accts = Mail.accounts.whose({id: job.accountId});
+        if (accts.length !== 1) return 'SKIP\\t' + accts.length + ' accounts with id ' + job.accountId + ' (need exactly 1)';
+        const acct = accts[0];
         const mbs = acct.mailboxes;
-        for (let i = 0; i < mbs.length && allmail === null; i++) {
-          try { if (String(mbs[i].name()) === 'All Mail') allmail = mbs[i]; } catch (e) {}
+        const dests = [];
+        for (let i = 0; i < mbs.length; i++) {
+          let path = null;
+          try { path = fullPath(mbs[i]); } catch (e) {}
+          if (path === null) return 'SKIP\\tcould not read a mailbox path on account ' + job.accountId;
+          if (path === job.allMailPath) dests.push(mbs[i]);
         }
-        if (allmail === null) return 'SKIP\\tno All Mail mailbox on account "' + job.account + '"';
+        if (dests.length !== 1) return 'SKIP\\t' + dests.length + ' mailboxes at "' + job.allMailPath + '" on account ' + job.accountId + ' (need exactly 1)';
+        allmail = dests[0];
         const found = rec.messages.whose({messageId: job.mid});
         const msgs = [], cands = [];
         for (let i = 0; i < found.length; i++) {
@@ -235,30 +317,41 @@ extension MailStore {
         let recovered: Int64
         let allMail: Int64
         let trash: Int64
+        let accountUUID: String     // == Mail.app account id
+        let allMailPath: String     // "[Gmail]/All Mail" == Mail.app full mailbox path
+    }
+
+    /// "imap://UUID/%5BGmail%5D/All%20Mail" -> "[Gmail]/All Mail"
+    static func mailboxPath(fromURL url: String) -> String? {
+        guard let components = URL(string: url)?.pathComponents else { return nil }
+        let parts = components.filter { $0 != "/" }.map { $0.removingPercentEncoding ?? $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "/")
     }
 
     func rescueBoxes() throws -> RescueBoxes {
-        guard let account = accounts.first(where: { $0.name == rescueAccountName }) else {
-            throw ToolError("No Mail account named \"\(rescueAccountName)\"")
+        let named = accounts.filter { $0.name == rescueAccountName }
+        guard named.count == 1, let account = named.first else {
+            throw ToolError("\(named.count) Mail accounts named \"\(rescueAccountName)\" (need exactly 1)")
         }
-        var recovered: Int64?, allMail: Int64?, trash: Int64?
+        var recovered: [Int64] = [], allMail: [Int64] = [], trash: [Int64] = []
         for row in try db.query("SELECT ROWID, url FROM mailboxes") {
             guard let rowID = row[0].intValue, let url = row[1].stringValue else { continue }
-            let name = Self.mailboxName(fromURL: url)
-            if url.hasPrefix("local://") && name == rescueRecoveredMailboxName {
-                recovered = rowID
-            } else if URL(string: url)?.host == account.uuid {
-                if name == "All Mail" { allMail = rowID }
-                if name == "Trash" { trash = rowID }
+            if url.hasPrefix("local://") && Self.mailboxName(fromURL: url) == rescueRecoveredMailboxName {
+                recovered.append(rowID)
+            } else if url.hasPrefix("imap://"), URL(string: url)?.host == account.uuid {
+                let path = Self.mailboxPath(fromURL: url)
+                if path == rescueAllMailPath { allMail.append(rowID) }
+                if path == rescueTrashPath { trash.append(rowID) }
             }
         }
-        guard let recovered else {
-            throw ToolError("No \"\(rescueRecoveredMailboxName)\" mailbox in the mail index — nothing to rescue")
+        guard recovered.count == 1 else {
+            throw ToolError("\(recovered.count) \"\(rescueRecoveredMailboxName)\" mailboxes in the mail index (need exactly 1) — nothing to rescue")
         }
-        guard let allMail, let trash else {
-            throw ToolError("Cannot find All Mail and Trash for account \(rescueAccountName) in the mail index")
+        guard allMail.count == 1, trash.count == 1 else {
+            throw ToolError("Need exactly one \(rescueAllMailPath) and one \(rescueTrashPath) for account \(rescueAccountName) in the mail index (found \(allMail.count) and \(trash.count))")
         }
-        return RescueBoxes(recovered: recovered, allMail: allMail, trash: trash)
+        return RescueBoxes(recovered: recovered[0], allMail: allMail[0], trash: trash[0],
+                           accountUUID: account.uuid, allMailPath: rescueAllMailPath)
     }
 
     func recoveredRows(box: Int64, since: Int64?, subject: String?, limit: Int) throws -> [RescueRow] {
@@ -359,24 +452,23 @@ func mailRescueRecoveredText(since: String?, subject: String?, limit: Int, apply
         return lines.joined(separator: "\n")
     }
 
-    var outcomes: [(row: MailStore.RescueRow, status: RescueStatus, message: String)] = []
-    for row in rows {
+    // One message at a time; the first UNKNOWN (a timeout included) stops
+    // the batch — the rest are NOT_ATTEMPTED, never moved.
+    let results = rescueRunBatch(rows) { row -> (status: RescueStatus, message: String) in
         // Re-read everything right before acting on this row: earlier moves
         // in the same run bump the watermark and may have changed the index.
         let watermark = try? store.maxMessageRowID()
         let before = store.rescueState(row, boxes: boxes)
         if let refusal = rescuePrecheck(rowID: row.id, dateSent: row.dateSent, watermark: watermark, state: before) {
-            let v = rescueVerdict(rowID: row.id, watermark: watermark ?? Int64.max,
-                                  move: .notAttempted(refusal), state: before)
-            outcomes.append((row, v.status, v.message))
-            continue
+            return rescueVerdict(rowID: row.id, watermark: watermark ?? Int64.max,
+                                 move: .notAttempted(refusal), state: before)
         }
         guard let wm = watermark, let mid = row.header, let ds = row.dateSent else {
-            outcomes.append((row, .stillInRecovered, "not moved: no Message-ID in the index"))
-            continue
+            return (.stillInRecovered, "not moved: no Message-ID in the index")
         }
         let job: [String: Any] = ["id": row.id, "mid": mid, "ds": ds,
-                                  "account": rescueAccountName, "recovered": rescueRecoveredMailboxName]
+                                  "accountId": boxes.accountUUID, "allMailPath": boxes.allMailPath,
+                                  "recovered": rescueRecoveredMailboxName]
         let json = String(decoding: (try? JSONSerialization.data(withJSONObject: job)) ?? Data(), as: UTF8.self)
 
         let move: RescueMove
@@ -386,25 +478,32 @@ func mailRescueRecoveredText(since: String?, subject: String?, limit: Int, apply
             move = .indeterminate("the Mail.app move call failed or timed out (\(error))")
         }
 
-        var verdict = rescueVerdict(rowID: row.id, watermark: wm, move: move, state: store.rescueState(row, boxes: boxes))
+        // The index settles asynchronously (and passed through an All Mail +
+        // Trash state on 2026-11-23). Observe every rescueStableGap seconds;
+        // stop early only once OK is confirmed by two identical observations,
+        // otherwise judge whatever the deadline leaves.
+        let started = Date()
+        var observations = [(at: TimeInterval(0), state: store.rescueState(row, boxes: boxes))]
         if move == .moved {
-            // The index settles asynchronously (and passed through an
-            // All Mail + Trash state on 2026-11-23): poll for the end state.
-            let deadline = Date().addingTimeInterval(settleSeconds)
-            while verdict.status != .ok && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.5)
-                verdict = rescueVerdict(rowID: row.id, watermark: wm, move: move,
-                                        state: store.rescueState(row, boxes: boxes))
+            while Date().timeIntervalSince(started) + rescueStableGap <= settleSeconds {
+                if rescueStableVerdict(rowID: row.id, watermark: wm, move: move,
+                                       observations: observations).status == .ok { break }
+                Thread.sleep(forTimeInterval: rescueStableGap)
+                observations.append((at: Date().timeIntervalSince(started),
+                                     state: store.rescueState(row, boxes: boxes)))
             }
         }
-        outcomes.append((row, verdict.status, verdict.message))
+        return rescueStableVerdict(rowID: row.id, watermark: wm, move: move, observations: observations)
     }
+    let outcomes = zip(rows, results).map { (row: $0, status: $1.status, message: $1.message) }
 
     let ok = outcomes.filter { $0.status == .ok }.count
     let still = outcomes.filter { $0.status == .stillInRecovered }.count
     let unknown = outcomes.filter { $0.status == .unknown }.count
+    let skipped = outcomes.filter { $0.status == .notAttempted }.count
     var lines = ["Rescued \(ok) of \(outcomes.count) message(s) from \(rescueRecoveredMailboxName) to All Mail"
-                 + "\(filterText): \(still) still in Recovered, \(unknown) unknown. Only OK is success:"]
+                 + "\(filterText): \(still) still in Recovered, \(unknown) unknown, \(skipped) not attempted"
+                 + (skipped > 0 ? " (stopped at the first UNKNOWN)" : "") + ". Only OK is success:"]
     for outcome in outcomes {
         lines.append("  [\(outcome.row.id)] \(outcome.status.rawValue) — \(outcome.message)")
         lines.append("      \(label(outcome.row))")

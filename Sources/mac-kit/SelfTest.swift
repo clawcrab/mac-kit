@@ -540,6 +540,59 @@ struct SelfTestCommand: ParsableCommand {
                     "fingerprint: Swift and JS agree on vector \(index)")
         }
 
+        // Stability: after a completed move, OK needs the same OK state on the
+        // last two observations, at least rescueStableGap seconds apart.
+        let okState = st([], [601], [])
+        func sv(_ obs: [(TimeInterval, RescueState)], _ move: RescueMove = .moved) -> RescueStatus {
+            rescueStableVerdict(rowID: 500, watermark: 600, move: move,
+                                observations: obs.map { (at: $0.0, state: $0.1) }).status
+        }
+        t.equal(sv([(0, okState), (5, okState)]), .ok, "stable: same OK state twice 5s apart is OK")
+        t.equal(sv([(0, okState)]), .unknown, "stable: OK seen once is not confirmed")
+        t.equal(sv([(0, okState), (5, st([], [601], [602]))]), .unknown,
+                "stable: matched once then changed (Trash copy appeared) is not OK")
+        t.equal(sv([(0, okState), (5, st([500], [], []))]), .unknown,
+                "stable: matched once then back in Recovered is not OK")
+        t.equal(sv([(0, okState), (5, st([], [602], []))]), .unknown,
+                "stable: OK twice but a different All Mail copy each time is not OK")
+        t.equal(sv([(0, okState), (4.9, okState)]), .unknown, "stable: two OK looks under 5s apart is not OK")
+        t.equal(sv([(0, okState), (5, okState), (10, st([], [], []))]), .unknown,
+                "stable: confirmed OK that later changes is judged on the latest pair")
+        t.equal(sv([(0, st([], [601], [602])), (5, okState), (10, okState)]), .ok,
+                "stable: a transient All Mail + Trash state that settles to OK is OK")
+        t.equal(sv([(0, st([500], [], [])), (5, st([500], [], []))]), .stillInRecovered,
+                "stable: still in Recovered on two looks is STILL_IN_RECOVERED")
+        t.equal(sv([(0, st([500], [], [])), (5, okState)]), .unknown,
+                "stable: just changed to OK on the last look is not confirmed")
+        t.equal(sv([]), .unknown, "stable: no observation is unknown")
+        t.equal(sv([(0, okState), (5, okState)], .indeterminate("timed out")), .unknown,
+                "stable: a timed-out move stays UNKNOWN however stable the index is")
+        t.equal(sv([(0, st([500], [], []))], .notAttempted("refused")), .stillInRecovered,
+                "stable: a refused move needs one look only")
+
+        // Batch: the first UNKNOWN stops everything after it.
+        var batchCalls: [Int] = []
+        let batch = rescueRunBatch([1, 2, 3, 4]) { item -> (status: RescueStatus, message: String) in
+            batchCalls.append(item)
+            return item == 2 ? (.unknown, "timed out") : (.ok, "fine")
+        }
+        t.equal(batchCalls, [1, 2], "batch: nothing is attempted after the first UNKNOWN")
+        t.equal(batch.map { $0.status }, [.ok, .unknown, .notAttempted, .notAttempted],
+                "batch: the rest are NOT_ATTEMPTED")
+        var allCalls = 0
+        let clean = rescueRunBatch([1, 2, 3]) { item -> (status: RescueStatus, message: String) in
+            allCalls += 1
+            return item == 1 ? (.stillInRecovered, "skipped") : (.ok, "fine")
+        }
+        t.equal(allCalls, 3, "batch: STILL_IN_RECOVERED does not stop the batch")
+        t.check(!clean.contains { $0.status == .notAttempted }, "batch: no UNKNOWN, nothing marked NOT_ATTEMPTED")
+
+        // Identity: the index-side path that the script is asked to match.
+        t.equal(MailStore.mailboxPath(fromURL: "imap://A4273468-266C-4001-B575-AE2F5FFF0D66/%5BGmail%5D/All%20Mail"),
+                "[Gmail]/All Mail", "mailbox path: full decoded path from the index URL")
+        t.equal(MailStore.mailboxPath(fromURL: "imap://A4273468-266C-4001-B575-AE2F5FFF0D66/INBOX"), "INBOX",
+                "mailbox path: top-level mailbox")
+
         // JXA pick inside Recovered.
         js.evaluateScript(rescuePickJS)
         t.equal(evalJS("rescuePick([{id: 500, ds: 1000}], 1000, 500)"), "\"ok\"", "rescue pick: sole match is the row")
@@ -558,6 +611,10 @@ struct SelfTestCommand: ParsableCommand {
                 "mail_rescue_recovered script embeds the tested pick")
         t.check(!rescueScript.contains("Mail.delete") && !rescueScript.contains(".delete("),
                 "mail_rescue_recovered script never deletes")
+        t.check(rescueScript.contains("Mail.accounts.whose({id: job.accountId})")
+                    && rescueScript.contains("path === job.allMailPath")
+                    && !rescueScript.contains("job.account)") && !rescueScript.contains("=== 'All Mail'"),
+                "mail_rescue_recovered script pins account by id and All Mail by full path, not by name")
 
         try t.finish()
     }
