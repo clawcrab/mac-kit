@@ -508,8 +508,10 @@ struct SelfTestCommand: ParsableCommand {
 
         // Pre-check: only the sole fingerprint match in Recovered, nothing in
         // All Mail or Trash yet, with a watermark and a Date.
-        func rp(_ state: RescueState, ds: Int64? = 1_795_000_000, wm: Int64? = 600) -> Bool {
-            rescuePrecheck(rowID: 500, dateSent: ds, watermark: wm, state: state) == nil
+        func rp(_ state: RescueState, ds: Int64? = 1_795_000_000, wm: Int64? = 600,
+                header: String? = "m77@example.com", expected: String? = nil) -> Bool {
+            rescuePrecheck(rowID: 500, header: header, expectedMessageID: expected,
+                           dateSent: ds, watermark: wm, state: state) == nil
         }
         t.check(rp(st([500], [], [])), "rescue precheck: sole Recovered copy proceeds")
         t.check(!rp(st([500], [480], [])), "rescue precheck: already in All Mail is not moved (no duplicate)")
@@ -519,6 +521,19 @@ struct SelfTestCommand: ParsableCommand {
         t.check(!rp(st([500], nil, [])), "rescue precheck: failed lookup refuses")
         t.check(!rp(st([500], [], []), ds: nil), "rescue precheck: no Date refuses")
         t.check(!rp(st([500], [], []), wm: nil), "rescue precheck: no watermark refuses")
+        // Same eligibility in the dry run and apply: a row with no Message-ID
+        // is never eligible (Mail.app could not find it by Message-ID).
+        t.check(!rp(st([500], [], []), header: nil), "rescue precheck: no Message-ID is not eligible")
+        t.check(!rp(st([500], [], []), header: "<>"), "rescue precheck: an empty Message-ID is not eligible")
+        // apply: the id must still carry the Message-ID the dry run showed.
+        t.check(rp(st([500], [], []), expected: "m77@example.com"), "rescue precheck: matching message_id proceeds")
+        t.check(rp(st([500], [], []), expected: "<m77@example.com>"), "rescue precheck: message_id may keep its angle brackets")
+        t.check(!rp(st([500], [], []), expected: "other@example.com"),
+                "rescue precheck: an id that now belongs to another message is not moved")
+        t.check(rescuePrecheck(rowID: 500, header: "m77@example.com", expectedMessageID: "other@example.com",
+                               dateSent: 1_795_000_000, watermark: 600, state: st([500], [], []))?
+                    .contains("no longer refers to that message") == true,
+                "rescue precheck: a stale id says to run the dry run again")
 
         // Script reply parsing: only a clean MOVED is a completed move.
         t.equal(rescueMove(fromScriptOutput: "MOVED"), .moved, "rescue reply: MOVED")
@@ -573,15 +588,18 @@ struct SelfTestCommand: ParsableCommand {
 
         // Requests: apply takes exactly one explicit id and nothing else;
         // nonsense limits are refused, not adjusted.
-        func req(apply: Bool, id: Int64? = nil, since: String? = nil, subject: String? = nil,
-                 limit: Int? = nil) -> RescueRequest? {
-            try? rescueRequest(apply: apply, id: id, since: since, subject: subject, limit: limit)
+        func req(apply: Bool, id: Int64? = nil, mid: String? = "m77@example.com", since: String? = nil,
+                 subject: String? = nil, limit: Int? = nil) -> RescueRequest? {
+            try? rescueRequest(apply: apply, id: id, messageID: mid, since: since, subject: subject, limit: limit)
         }
-        t.equal(req(apply: true, id: 500), .apply(id: 500), "request: apply with an id moves just that id")
+        t.equal(req(apply: true, id: 500), .apply(id: 500, messageID: "m77@example.com"),
+                "request: apply with an id and message_id moves just that id")
+        t.equal(req(apply: true, id: 500, mid: nil), nil, "request: apply without message_id is rejected")
+        t.equal(req(apply: true, id: 500, mid: " <> "), nil, "request: apply with an empty message_id is rejected")
         t.equal(req(apply: true), nil, "request: apply without an id is rejected")
         t.throwsError(matching: { $0.contains("explicit \"id\"") && $0.contains("nothing was moved") },
                       "request: apply without an id says why") {
-            _ = try rescueRequest(apply: true, id: nil, since: nil, subject: nil, limit: nil)
+            _ = try rescueRequest(apply: true, id: nil, messageID: "m77@example.com", since: nil, subject: nil, limit: nil)
         }
         t.equal(req(apply: true, id: 500, limit: 5), nil, "request: apply refuses a limit (no batches)")
         t.equal(req(apply: true, id: 500, since: "2026-11-01"), nil, "request: apply refuses since")
@@ -591,6 +609,44 @@ struct SelfTestCommand: ParsableCommand {
                 .list(id: nil, since: "2026-11-01", subject: "x", limit: 3), "request: dry run keeps its filters")
         t.equal(req(apply: false, limit: 0), nil, "request: limit 0 is refused, not turned into 1")
         t.equal(req(apply: false, limit: -2), nil, "request: negative limit is refused")
+
+        // MCP integer arguments: exact integers only, never truncated.
+        func intArg(_ json: String) -> String {
+            let parsed = (try? JSONSerialization.jsonObject(with: Data("{\"id\": \(json)}".utf8))) as? [String: Any]
+            do { return (try strictInt64Argument(parsed?["id"], name: "id")).map(String.init) ?? "absent" }
+            catch { return "error" }
+        }
+        t.equal(intArg("50442"), "50442", "int arg: an integer passes through")
+        t.equal(intArg("500.9"), "error", "int arg: 500.9 is rejected, not truncated to 500")
+        t.equal(intArg("-0.5"), "error", "int arg: a fraction is rejected")
+        t.equal(intArg("\"500\""), "error", "int arg: a string is rejected")
+        t.equal(intArg("true"), "error", "int arg: a boolean is rejected")
+        t.equal(intArg("1e30"), "error", "int arg: out of Int64 range is rejected")
+        t.equal(intArg("9223372036854775808"), "error", "int arg: Int64.max + 1 is rejected")
+        t.equal(intArg("9223372036854775807"), "9223372036854775807", "int arg: Int64.max passes")
+        t.equal(intArg("null"), "absent", "int arg: null is absent")
+        t.equal((try? strictInt64Argument(nil, name: "id")).map { $0.map(String.init) ?? "absent" }, "absent",
+                "int arg: missing is absent")
+
+        // ...and the MCP dispatch really uses it (dry run only: even a
+        // regression here could at most list, never move).
+        func dispatch(_ args: [String: Any]) -> (isError: Bool, text: String) {
+            var reply: [String: Any] = [:]
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                reply = await MCPServer().callTool(params: ["name": "mail_rescue_recovered", "arguments": args])
+                done.signal()
+            }
+            done.wait()
+            let text = ((reply["content"] as? [[String: Any]])?.first?["text"] as? String) ?? ""
+            return ((reply["isError"] as? Bool) ?? false, text)
+        }
+        let fractional = dispatch(["id": NSNumber(value: 500.9), "apply": false])
+        t.check(fractional.isError && fractional.text.contains("exact integer"),
+                "mcp: id 500.9 is rejected by mail_rescue_recovered, not truncated")
+        let stringID = dispatch(["id": "500", "apply": false])
+        t.check(stringID.isError && stringID.text.contains("must be an integer"),
+                "mcp: a string id is rejected by mail_rescue_recovered")
 
         // Local-only claim: the status name and message say so.
         t.equal(RescueStatus.movedLocally.rawValue, "MOVED_LOCALLY", "status: success is named MOVED_LOCALLY")

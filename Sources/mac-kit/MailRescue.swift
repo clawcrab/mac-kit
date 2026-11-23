@@ -94,9 +94,26 @@ struct RescueState: Equatable {
     }
 }
 
+/// "<abc@x>" / " abc@x " -> "abc@x"; nil when nothing is left.
+func rescueNormalizeMessageID(_ raw: String?) -> String? {
+    guard let raw else { return nil }
+    let trimmed = raw.trimmingCharacters(in: CharacterSet(charactersIn: "<> \t\r\n"))
+    return trimmed.isEmpty ? nil : trimmed
+}
+
 /// May this Recovered row be moved at all? nil = proceed, otherwise the
-/// reason it is left where it is. Fails closed on anything unclear.
-func rescuePrecheck(rowID: Int64, dateSent: Int64?, watermark: Int64?, state: RescueState) -> String? {
+/// reason it is left where it is. Fails closed on anything unclear. The dry
+/// run and apply run the same check; apply also passes `expectedMessageID`
+/// (what the caller saw in the dry run) so a ROWID that now belongs to a
+/// different message — e.g. after an index rebuild — is never moved.
+func rescuePrecheck(rowID: Int64, header: String?, expectedMessageID: String? = nil,
+                    dateSent: Int64?, watermark: Int64?, state: RescueState) -> String? {
+    guard let header = rescueNormalizeMessageID(header) else {
+        return "no Message-ID in the index — cannot identify it in Mail.app"
+    }
+    if let expectedMessageID, rescueNormalizeMessageID(expectedMessageID) != header {
+        return "id \(rowID) no longer refers to that message (its Message-ID is now <\(header)>), run the dry run again"
+    }
     guard watermark != nil else {
         return "could not read the mail index watermark — cannot tell this run's copies from older ones"
     }
@@ -443,33 +460,54 @@ extension MailStore {
 
 // MARK: Tool
 
+/// An integer tool argument, exactly as sent, or nil when absent. Anything
+/// that is not an exact integer in Int64 range — 500.9, "500", true,
+/// 1e30 — is an error, never truncated or coerced.
+func strictInt64Argument(_ value: Any?, name: String) throws -> Int64? {
+    guard let value, !(value is NSNull) else { return nil }
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+        throw ToolError("\"\(name)\" must be an integer, got \(value) — nothing was moved")
+    }
+    let exact = number.int64Value
+    let roundTrips = NSDecimalNumber(decimal: number.decimalValue) == NSDecimalNumber(value: exact)
+    guard roundTrips else {
+        throw ToolError("\"\(name)\" must be an exact integer in range, got \(number) — nothing was moved")
+    }
+    return exact
+}
+
 /// What one call asks for. apply takes exactly one explicit id and none of
 /// the dry-run filters; nonsense limits are refused rather than adjusted.
 enum RescueRequest: Equatable {
     case list(id: Int64?, since: String?, subject: String?, limit: Int)
-    case apply(id: Int64)
+    case apply(id: Int64, messageID: String)
 }
 
-func rescueRequest(apply: Bool, id: Int64?, since: String?, subject: String?,
+func rescueRequest(apply: Bool, id: Int64?, messageID: String? = nil, since: String?, subject: String?,
                    limit: Int?) throws -> RescueRequest {
     if apply {
         guard let id else {
             throw ToolError("mail_rescue_recovered apply: true needs an explicit \"id\" — it moves exactly one message. "
                 + "Run it without apply first to list the ids and see which are eligible; nothing was moved")
         }
-        guard since == nil, subject == nil, limit == nil else {
-            throw ToolError("mail_rescue_recovered apply: true takes only \"id\" — since/subject/limit are dry-run filters; nothing was moved")
+        guard let messageID = rescueNormalizeMessageID(messageID) else {
+            throw ToolError("mail_rescue_recovered apply: true also needs \"message_id\" — the Message-ID the dry run printed for id \(id), "
+                + "so a stale id can never move a different message; nothing was moved")
         }
-        return .apply(id: id)
+        guard since == nil, subject == nil, limit == nil else {
+            throw ToolError("mail_rescue_recovered apply: true takes only \"id\" and \"message_id\" — since/subject/limit are dry-run filters; nothing was moved")
+        }
+        return .apply(id: id, messageID: messageID)
     }
     let wanted = limit ?? 50
     guard wanted >= 1 else { throw ToolError("mail_rescue_recovered \"limit\" must be at least 1") }
     return .list(id: id, since: since, subject: subject, limit: wanted)
 }
 
-func mailRescueRecoveredText(apply: Bool, id: Int64?, since: String?, subject: String?,
+func mailRescueRecoveredText(apply: Bool, id: Int64?, messageID: String?, since: String?, subject: String?,
                              limit: Int?, settleSeconds: Double = 30) throws -> String {
-    let request = try rescueRequest(apply: apply, id: id, since: since, subject: subject, limit: limit)
+    let request = try rescueRequest(apply: apply, id: id, messageID: messageID, since: since,
+                                    subject: subject, limit: limit)
     let store = try MailStore()
     let boxes = try store.rescueBoxes()
     func label(_ row: MailStore.RescueRow) -> String {
@@ -489,21 +527,24 @@ func mailRescueRecoveredText(apply: Bool, id: Int64?, since: String?, subject: S
         if rows.isEmpty { return "No messages in \(rescueRecoveredMailboxName)\(filterText)." }
         let watermark = try? store.maxMessageRowID()
         var lines = ["DRY RUN — nothing moved. \(rows.count) message(s) in \(rescueRecoveredMailboxName)\(filterText). "
-                     + "To move one back to [Gmail]/All Mail, call again with apply: true and its id:"]
+                     + "To move one back to [Gmail]/All Mail, call again with apply: true, its id and its message_id:"]
         for row in rows {
             let state = store.rescueState(row, boxes: boxes)
-            let plan = rescuePrecheck(rowID: row.id, dateSent: row.dateSent, watermark: watermark, state: state)
+            let plan = rescuePrecheck(rowID: row.id, header: row.header, dateSent: row.dateSent,
+                                      watermark: watermark, state: state)
                 .map { "not eligible: \($0)" } ?? "eligible"
             lines.append("  [\(row.id)] \(label(row))")
+            lines.append("      message_id: \(row.header ?? "(none in the index)")")
             lines.append("      \(plan)")
         }
         return lines.joined(separator: "\n")
 
-    case .apply(let id):
+    case .apply(let id, let messageID):
         guard let row = try rescueRecoveredRows(db: store.db, box: boxes.recovered, id: id, limit: 1).first else {
-            throw ToolError("No message [\(id)] in \(rescueRecoveredMailboxName) — nothing was moved; run the dry run to list the ids")
+            throw ToolError("No message [\(id)] in \(rescueRecoveredMailboxName) — nothing was moved; run the dry run again to list the ids")
         }
-        let result = rescueApplyOne(row, store: store, boxes: boxes, settleSeconds: settleSeconds)
+        let result = rescueApplyOne(row, expectedMessageID: messageID, store: store, boxes: boxes,
+                                    settleSeconds: settleSeconds)
         return [
             "[\(row.id)] \(result.status.rawValue) — \(result.message)",
             "    \(label(row))",
@@ -513,11 +554,12 @@ func mailRescueRecoveredText(apply: Bool, id: Int64?, since: String?, subject: S
 }
 
 /// Move one Recovered row to All Mail and judge the local end state.
-private func rescueApplyOne(_ row: MailStore.RescueRow, store: MailStore, boxes: MailStore.RescueBoxes,
-                            settleSeconds: Double) -> (status: RescueStatus, message: String) {
+private func rescueApplyOne(_ row: MailStore.RescueRow, expectedMessageID: String, store: MailStore,
+                            boxes: MailStore.RescueBoxes, settleSeconds: Double) -> (status: RescueStatus, message: String) {
     let watermark = try? store.maxMessageRowID()
     let before = store.rescueState(row, boxes: boxes)
-    if let refusal = rescuePrecheck(rowID: row.id, dateSent: row.dateSent, watermark: watermark, state: before) {
+    if let refusal = rescuePrecheck(rowID: row.id, header: row.header, expectedMessageID: expectedMessageID,
+                                    dateSent: row.dateSent, watermark: watermark, state: before) {
         return rescueVerdict(rowID: row.id, watermark: watermark ?? Int64.max,
                              move: .notAttempted(refusal), state: before)
     }

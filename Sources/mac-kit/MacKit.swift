@@ -206,11 +206,14 @@ struct MailArchive: ParsableCommand {
 struct MailRescueRecovered: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "rescue-recovered",
-        abstract: "List mail in \"Recovered Messages (Google)\" (dry run); with --apply --id N, move that one message back to All Mail."
+        abstract: "List mail in \"Recovered Messages (Google)\" (dry run); with --apply --id N --message-id M, move that one message back to All Mail."
     )
 
     @Option(help: "Message id: required with --apply (the one message to move); filters the dry run otherwise")
     var id: Int64?
+
+    @Option(name: .customLong("message-id"), help: "Required with --apply: the Message-ID the dry run printed for --id")
+    var messageID: String?
 
     @Option(help: "Dry run only: messages received on/after this ISO date")
     var since: String?
@@ -225,7 +228,7 @@ struct MailRescueRecovered: ParsableCommand {
     var apply = false
 
     func run() throws {
-        print(try mailRescueRecoveredText(apply: apply, id: id, since: since, subject: subject, limit: limit))
+        print(try mailRescueRecoveredText(apply: apply, id: id, messageID: messageID, since: since, subject: subject, limit: limit))
     }
 }
 

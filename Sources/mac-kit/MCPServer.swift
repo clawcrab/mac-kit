@@ -335,11 +335,12 @@ struct MCPServer {
         ],
         [
             "name": "mail_rescue_recovered",
-            "description": "Gmail messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout). Default is a DRY RUN that moves nothing: lists the messages (optional since/subject/limit/id filters) with id, date, subject and whether each is eligible to move, with the reason if not. apply: true moves EXACTLY ONE message — the one named by \"id\" — back to [Gmail]/All Mail; apply without an id is rejected, and since/subject/limit are not accepted with apply. Never deletes; never touches INBOX, Trash or any other message. The result is judged from Mail.app's LOCAL index (Message-ID + Date fingerprint, one-query snapshots): MOVED_LOCALLY (gone from Recovered, exactly one new All Mail copy, nothing in Trash — the same state on two looks at least 5s apart), STILL_IN_RECOVERED (with the reason), or UNKNOWN (including a timed-out move or a state that did not settle within 30s). MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it.",
+            "description": "Gmail messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout). Default is a DRY RUN that moves nothing: lists the messages (optional since/subject/limit/id filters) with id, Message-ID, date, subject and whether each is eligible to move, with the reason if not. apply: true moves EXACTLY ONE message — the one named by \"id\", which must still carry the \"message_id\" the dry run printed — back to [Gmail]/All Mail; apply without both is rejected, and since/subject/limit are not accepted with apply. Never deletes; never touches INBOX, Trash or any other message. The result is judged from Mail.app's LOCAL index (Message-ID + Date fingerprint, one-query snapshots): MOVED_LOCALLY (gone from Recovered, exactly one new All Mail copy, nothing in Trash — the same state on two looks at least 5s apart), STILL_IN_RECOVERED (with the reason), or UNKNOWN (including a timed-out move or a state that did not settle within 30s). MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "id": ["type": "integer", "description": "Message id from the dry run. Required with apply: true (the one message to move); in a dry run, lists just that message"],
+                    "message_id": ["type": "string", "description": "Required with apply: true — the Message-ID the dry run printed for this id. If the id now refers to a different message, nothing is moved"],
                     "apply": ["type": "boolean", "description": "true to move the one message named by id (default false = dry run)"],
                     "since": ["type": "string", "description": "Dry run only: messages received on/after this ISO date, e.g. \"2026-11-01\""],
                     "subject": ["type": "string", "description": "Dry run only: case-insensitive substring the subject must contain"],
@@ -397,7 +398,7 @@ struct MCPServer {
         }
     }
 
-    private func callTool(params: [String: Any]) async -> [String: Any] {
+    func callTool(params: [String: Any]) async -> [String: Any] {
         let name = params["name"] as? String ?? ""
         let args = params["arguments"] as? [String: Any] ?? [:]
         do {
@@ -573,7 +574,8 @@ struct MCPServer {
             case "mail_rescue_recovered":
                 text = try mailRescueRecoveredText(
                     apply: (args["apply"] as? Bool) ?? false,
-                    id: (args["id"] as? NSNumber)?.int64Value,
+                    id: try strictInt64Argument(args["id"], name: "id"),
+                    messageID: args["message_id"] as? String,
                     since: args["since"] as? String,
                     subject: args["subject"] as? String,
                     limit: (args["limit"] as? NSNumber)?.intValue
