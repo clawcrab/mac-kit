@@ -335,13 +335,13 @@ struct MCPServer {
         ],
         [
             "name": "mail_rescue_recovered",
-            "description": "List messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout) and, with apply: true, move them back to [Gmail]/All Mail one at a time. Default is a DRY RUN that moves nothing. Never deletes; never touches INBOX or Trash. Success is judged from the mail index afterwards (Message-ID + Date fingerprint): per message OK (gone from Recovered, exactly one new All Mail copy, nothing in Trash — the same state on two looks at least 5s apart), STILL_IN_RECOVERED, UNKNOWN (including any timed-out move or a state that did not settle within 30s), or NOT_ATTEMPTED (the batch stops at the first UNKNOWN). Only OK is success.",
+            "description": "List messages Mail.app quarantined in the local \"Recovered Messages (Google)\" mailbox (e.g. after a mail_archive timeout) and, with apply: true, move them back to [Gmail]/All Mail one at a time. Default is a DRY RUN that moves nothing. Never deletes; never touches INBOX or Trash. The result is judged from Mail.app's LOCAL index afterwards (Message-ID + Date fingerprint, one-query snapshots): per message MOVED_LOCALLY (gone from Recovered, exactly one new All Mail copy, nothing in Trash — the same state on two looks at least 5s apart), STILL_IN_RECOVERED, UNKNOWN (including any timed-out move or a state that did not settle within 30s), or NOT_ATTEMPTED. MOVED_LOCALLY means the local index shows it in All Mail; this does not mean the Gmail server has synced it. apply moves at most 5 messages per run (larger limits are clamped), stops at the first UNKNOWN, and has a 150s overall deadline.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "since": ["type": "string", "description": "Optional ISO date; only messages received on/after it, e.g. \"2026-11-01\""],
                     "subject": ["type": "string", "description": "Optional case-insensitive substring the subject must contain"],
-                    "limit": ["type": "integer", "description": "Max messages to list/move (default 50)"],
+                    "limit": ["type": "integer", "description": "Max messages to list (default 50); apply moves at most 5 per run and clamps larger values"],
                     "apply": ["type": "boolean", "description": "true to actually move the listed messages back to All Mail (default false = dry run)"]
                 ]
             ]

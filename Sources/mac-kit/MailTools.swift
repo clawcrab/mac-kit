@@ -12,6 +12,8 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 
 final class ReadOnlyDB {
     private var handle: OpaquePointer?
+    /// Statements run so far (self-test uses it to check one-snapshot reads).
+    private(set) var queryCount = 0
 
     init(path: String) throws {
         var db: OpaquePointer?
@@ -39,6 +41,7 @@ final class ReadOnlyDB {
     /// Values come back as text/int/null (Mail's schema uses no blobs we need).
     func query(_ sql: String, _ bindings: [Value] = []) throws -> [[Value]] {
         guard let handle else { throw ToolError("Database is closed") }
+        queryCount += 1
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw ToolError("SQL prepare failed: \(String(cString: sqlite3_errmsg(handle)))")

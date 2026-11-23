@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import JavaScriptCore
+import SQLite3
 
 // MARK: - Self-test harness
 //
@@ -471,7 +472,7 @@ struct SelfTestCommand: ParsableCommand {
         func rv(_ move: RescueMove, _ state: RescueState) -> RescueStatus {
             rescueVerdict(rowID: 500, watermark: 600, move: move, state: state).status
         }
-        t.equal(rv(.moved, st([], [601], [])), .ok,
+        t.equal(rv(.moved, st([], [601], [])), .movedLocally,
                 "rescue: gone from Recovered, one new All Mail copy, no Trash is OK")
         t.equal(rv(.moved, st([500], [], [])), .stillInRecovered,
                 "rescue: move returned but still in Recovered is STILL_IN_RECOVERED")
@@ -547,7 +548,7 @@ struct SelfTestCommand: ParsableCommand {
             rescueStableVerdict(rowID: 500, watermark: 600, move: move,
                                 observations: obs.map { (at: $0.0, state: $0.1) }).status
         }
-        t.equal(sv([(0, okState), (5, okState)]), .ok, "stable: same OK state twice 5s apart is OK")
+        t.equal(sv([(0, okState), (5, okState)]), .movedLocally, "stable: same OK state twice 5s apart is OK")
         t.equal(sv([(0, okState)]), .unknown, "stable: OK seen once is not confirmed")
         t.equal(sv([(0, okState), (5, st([], [601], [602]))]), .unknown,
                 "stable: matched once then changed (Trash copy appeared) is not OK")
@@ -558,7 +559,7 @@ struct SelfTestCommand: ParsableCommand {
         t.equal(sv([(0, okState), (4.9, okState)]), .unknown, "stable: two OK looks under 5s apart is not OK")
         t.equal(sv([(0, okState), (5, okState), (10, st([], [], []))]), .unknown,
                 "stable: confirmed OK that later changes is judged on the latest pair")
-        t.equal(sv([(0, st([], [601], [602])), (5, okState), (10, okState)]), .ok,
+        t.equal(sv([(0, st([], [601], [602])), (5, okState), (10, okState)]), .movedLocally,
                 "stable: a transient All Mail + Trash state that settles to OK is OK")
         t.equal(sv([(0, st([500], [], [])), (5, st([500], [], []))]), .stillInRecovered,
                 "stable: still in Recovered on two looks is STILL_IN_RECOVERED")
@@ -574,18 +575,91 @@ struct SelfTestCommand: ParsableCommand {
         var batchCalls: [Int] = []
         let batch = rescueRunBatch([1, 2, 3, 4]) { item -> (status: RescueStatus, message: String) in
             batchCalls.append(item)
-            return item == 2 ? (.unknown, "timed out") : (.ok, "fine")
+            return item == 2 ? (.unknown, "timed out") : (.movedLocally, "fine")
         }
         t.equal(batchCalls, [1, 2], "batch: nothing is attempted after the first UNKNOWN")
-        t.equal(batch.map { $0.status }, [.ok, .unknown, .notAttempted, .notAttempted],
+        t.equal(batch.map { $0.status }, [.movedLocally, .unknown, .notAttempted, .notAttempted],
                 "batch: the rest are NOT_ATTEMPTED")
         var allCalls = 0
         let clean = rescueRunBatch([1, 2, 3]) { item -> (status: RescueStatus, message: String) in
             allCalls += 1
-            return item == 1 ? (.stillInRecovered, "skipped") : (.ok, "fine")
+            return item == 1 ? (.stillInRecovered, "skipped") : (.movedLocally, "fine")
         }
         t.equal(allCalls, 3, "batch: STILL_IN_RECOVERED does not stop the batch")
         t.check(!clean.contains { $0.status == .notAttempted }, "batch: no UNKNOWN, nothing marked NOT_ATTEMPTED")
+
+        // Overall deadline: never start an item that could run past the budget.
+        var clock: TimeInterval = 0
+        var timedCalls: [Int] = []
+        let timed = rescueRunBatch([1, 2, 3, 4, 5], budget: 150, perItemMax: 95, now: { clock }) {
+            item -> (status: RescueStatus, message: String) in
+            timedCalls.append(item)
+            clock += 40
+            return (.movedLocally, "fine")
+        }
+        t.equal(timedCalls, [1, 2], "deadline: an item that could end past 150s is not started")
+        t.equal(timed.map { $0.status }, [.movedLocally, .movedLocally, .notAttempted, .notAttempted, .notAttempted],
+                "deadline: everything not started is NOT_ATTEMPTED")
+        clock = 0
+        var fastCalls = 0
+        _ = rescueRunBatch([1, 2, 3, 4, 5], budget: 150, perItemMax: 95, now: { clock }) {
+            _ -> (status: RescueStatus, message: String) in
+            fastCalls += 1
+            clock += 8
+            return (.movedLocally, "fine")
+        }
+        t.equal(fastCalls, 5, "deadline: quick moves all fit in the budget")
+
+        // Batch size cap.
+        t.equal(rescueEffectiveLimit(50, apply: true).limit, 5, "limit: apply clamps 50 to 5")
+        t.check(rescueEffectiveLimit(50, apply: true).note?.contains("clamped to 5") == true,
+                "limit: clamping is noted in the output")
+        t.equal(rescueEffectiveLimit(3, apply: true).limit, 3, "limit: apply keeps a limit under the cap")
+        t.check(rescueEffectiveLimit(5, apply: true).note == nil, "limit: no note at the cap")
+        t.equal(rescueEffectiveLimit(50, apply: false).limit, 50, "limit: the dry run may list more")
+        t.equal(rescueEffectiveLimit(0, apply: true).limit, 1, "limit: nonsense limits become 1")
+
+        // Local-only claim: the status name and message say so.
+        t.equal(RescueStatus.movedLocally.rawValue, "MOVED_LOCALLY", "status: success is named MOVED_LOCALLY")
+        t.check(rescueVerdict(rowID: 500, watermark: 600, move: .moved, state: okState).message
+                    .contains("does not mean the Gmail server has synced"),
+                "status: MOVED_LOCALLY says it is not proof of server sync")
+
+        // One observation = one statement over all three mailboxes, on a
+        // fixture index (Recovered=23, All Mail=15, Trash=21, INBOX=16).
+        let fixture = NSTemporaryDirectory() + "mac-kit-selftest-\(getpid()).sqlite"
+        try? FileManager.default.removeItem(atPath: fixture)
+        var writer: OpaquePointer?
+        if sqlite3_open(fixture, &writer) == SQLITE_OK {
+            sqlite3_exec(writer, """
+                CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, mailbox INTEGER,
+                                       date_sent INTEGER, deleted INTEGER);
+                INSERT INTO messages VALUES (500, 77, 23, 1000, 0);
+                INSERT INTO messages VALUES (601, 77, 15, 1001, 0);
+                INSERT INTO messages VALUES (602, 77, 15, 1000, 1);
+                INSERT INTO messages VALUES (603, 77, 21, 5000, 0);
+                INSERT INTO messages VALUES (604, 77, 16, 1000, 0);
+                INSERT INTO messages VALUES (605, 88, 15, 1000, 0);
+                """, nil, nil, nil)
+        }
+        sqlite3_close(writer)
+        let fixtureBoxes = MailStore.RescueBoxes(recovered: 23, allMail: 15, trash: 21,
+                                                 accountUUID: "X", allMailPath: rescueAllMailPath)
+        if let fixtureDB = try? ReadOnlyDB(path: fixture) {
+            let before = fixtureDB.queryCount
+            let observed = rescueObserve(db: fixtureDB, boxes: fixtureBoxes, messageHash: 77, dateSent: 1000)
+            t.equal(fixtureDB.queryCount - before, 1, "snapshot: one observation runs exactly one statement")
+            t.equal(observed, st([500], [601], []),
+                    "snapshot: rows split per mailbox (deleted All Mail copy, other Date, INBOX and other Message-IDs ignored)")
+        } else {
+            t.check(false, "snapshot: fixture index could not be opened")
+        }
+        try? FileManager.default.removeItem(atPath: fixture)
+        t.check(rescueObserveSQL.contains("mailbox IN (?, ?, ?)"), "snapshot: the observation SQL covers all three mailboxes")
+        t.equal(rescuePartition([(id: 500, mailbox: 23, ds: nil, deleted: false)], boxes: fixtureBoxes, dateSent: 1000),
+                st(nil, [], []), "partition: an unreadable Date fails only that mailbox closed")
+        t.equal(rescuePartition([(id: 503, mailbox: 21, ds: 1000, deleted: true)], boxes: fixtureBoxes, dateSent: 1000),
+                st([], [], [503]), "partition: a deleted Trash copy still counts")
 
         // Identity: the index-side path that the script is asked to match.
         t.equal(MailStore.mailboxPath(fromURL: "imap://A4273468-266C-4001-B575-AE2F5FFF0D66/%5BGmail%5D/All%20Mail"),
