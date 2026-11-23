@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import JavaScriptCore
+import SQLite3
 
 // MARK: - Self-test harness
 //
@@ -458,6 +459,282 @@ struct SelfTestCommand: ParsableCommand {
                     && script.contains("function gmailArchivePrecheck(")
                     && script.contains("function gmailArchiveOutcome(") && script.contains("function newCopies("),
                 "mail_archive script embeds the tested criterion")
+
+        // MARK: mail_rescue_recovered (end state in the index, not the move call)
+        //
+        // State arguments are fingerprint-matching ROWIDs per mailbox. Row 500
+        // sits in Recovered; the watermark is 600, so a copy created by the
+        // move has a ROWID above 600.
+
+        func st(_ recovered: [Int64]?, _ allMail: [Int64]?, _ trash: [Int64]?) -> RescueState {
+            RescueState(recovered: recovered, allMail: allMail, trash: trash)
+        }
+        func rv(_ move: RescueMove, _ state: RescueState) -> RescueStatus {
+            rescueVerdict(rowID: 500, watermark: 600, move: move, state: state).status
+        }
+        t.equal(rv(.moved, st([], [601], [])), .movedLocally,
+                "rescue: gone from Recovered, one new All Mail copy, no Trash is OK")
+        t.equal(rv(.moved, st([500], [], [])), .stillInRecovered,
+                "rescue: move returned but still in Recovered is STILL_IN_RECOVERED")
+        t.equal(rv(.moved, st([], [601], [602])), .unknown,
+                "rescue: All Mail + Trash copy (the 50747/50748 state) is not OK")
+        t.equal(rv(.moved, st([], [], [])), .unknown,
+                "rescue: vanished from Recovered but not in All Mail is not OK")
+        t.equal(rv(.moved, st([], [], [601])), .unknown,
+                "rescue: landed in Trash only is not OK")
+        t.equal(rv(.moved, st([500], [601], [])), .unknown,
+                "rescue: copies in both Recovered and All Mail is unknown")
+        t.equal(rv(.moved, st([], [601, 602], [])), .unknown,
+                "rescue: two new All Mail copies is not OK")
+        t.equal(rv(.moved, st([], [480], [])), .unknown,
+                "rescue: an All Mail copy that predates the run is not proof of the move")
+        t.equal(rv(.moved, st([], [480, 601], [])), .unknown,
+                "rescue: old + new All Mail copies is not OK")
+        t.equal(rv(.moved, st(nil, [601], [])), .unknown, "rescue: failed Recovered lookup is unknown")
+        t.equal(rv(.moved, st([], nil, [])), .unknown, "rescue: failed All Mail lookup is unknown")
+        t.equal(rv(.moved, st([], [601], nil)), .unknown, "rescue: failed Trash lookup is unknown")
+        t.equal(rv(.indeterminate("osascript timed out"), st([], [601], [])), .unknown,
+                "rescue: a timed-out move is UNKNOWN even when the index looks done")
+        t.equal(rv(.indeterminate("Mail.move raised"), st([500], [], [])), .unknown,
+                "rescue: a move that threw is UNKNOWN even when still in Recovered")
+        t.equal(rv(.notAttempted("refused"), st([500], [], [])), .stillInRecovered,
+                "rescue: refused before moving and unchanged is STILL_IN_RECOVERED")
+        t.equal(rv(.notAttempted("already in All Mail"), st([500], [480], [])), .stillInRecovered,
+                "rescue: refused because already in All Mail stays STILL_IN_RECOVERED")
+        t.equal(rv(.notAttempted("refused"), st([], [601], [])), .unknown,
+                "rescue: not attempted can never be OK")
+        t.equal(rv(.notAttempted("refused"), st(nil, nil, nil)), .unknown,
+                "rescue: not attempted with unreadable state is unknown")
+
+        // Pre-check: only the sole fingerprint match in Recovered, nothing in
+        // All Mail or Trash yet, with a watermark and a Date.
+        func rp(_ state: RescueState, ds: Int64? = 1_795_000_000, wm: Int64? = 600,
+                header: String? = "m77@example.com", expected: String? = nil) -> Bool {
+            rescuePrecheck(rowID: 500, header: header, expectedMessageID: expected,
+                           dateSent: ds, watermark: wm, state: state) == nil
+        }
+        t.check(rp(st([500], [], [])), "rescue precheck: sole Recovered copy proceeds")
+        t.check(!rp(st([500], [480], [])), "rescue precheck: already in All Mail is not moved (no duplicate)")
+        t.check(!rp(st([500], [], [480])), "rescue precheck: a Trash copy already present refuses")
+        t.check(!rp(st([500, 501], [], [])), "rescue precheck: two Recovered fingerprint matches refuse")
+        t.check(!rp(st([501], [], [])), "rescue precheck: row without its own fingerprint refuses")
+        t.check(!rp(st([500], nil, [])), "rescue precheck: failed lookup refuses")
+        t.check(!rp(st([500], [], []), ds: nil), "rescue precheck: no Date refuses")
+        t.check(!rp(st([500], [], []), wm: nil), "rescue precheck: no watermark refuses")
+        // Same eligibility in the dry run and apply: a row with no Message-ID
+        // is never eligible (Mail.app could not find it by Message-ID).
+        t.check(!rp(st([500], [], []), header: nil), "rescue precheck: no Message-ID is not eligible")
+        t.check(!rp(st([500], [], []), header: "<>"), "rescue precheck: an empty Message-ID is not eligible")
+        // apply: the id must still carry the Message-ID the dry run showed.
+        t.check(rp(st([500], [], []), expected: "m77@example.com"), "rescue precheck: matching message_id proceeds")
+        t.check(rp(st([500], [], []), expected: "<m77@example.com>"), "rescue precheck: message_id may keep its angle brackets")
+        t.check(!rp(st([500], [], []), expected: "other@example.com"),
+                "rescue precheck: an id that now belongs to another message is not moved")
+        t.check(rescuePrecheck(rowID: 500, header: "m77@example.com", expectedMessageID: "other@example.com",
+                               dateSent: 1_795_000_000, watermark: 600, state: st([500], [], []))?
+                    .contains("no longer refers to that message") == true,
+                "rescue precheck: a stale id says to run the dry run again")
+
+        // Script reply parsing: only a clean MOVED is a completed move.
+        t.equal(rescueMove(fromScriptOutput: "MOVED"), .moved, "rescue reply: MOVED")
+        t.equal(rescueMove(fromScriptOutput: "SKIP\tnone"), .notAttempted("none"), "rescue reply: SKIP is not attempted")
+        t.check(rescueMove(fromScriptOutput: "ERRMOVE\t-1728") != .moved, "rescue reply: ERRMOVE is not a move")
+        t.check(rescueMove(fromScriptOutput: "") != .moved, "rescue reply: empty is not a move")
+        t.check(rescueMove(fromScriptOutput: "MOVED?") != .moved, "rescue reply: garbage is not a move")
+
+        // Swift fingerprint twin agrees with the JS one on the same vectors.
+        let fpVectors: [([(id: Int64, ds: Int64?)], Int64?)] = [
+            ([(1, 1000), (2, 5000)], 1000), ([(1, 1001)], 1000), ([(1, 1002)], 1000),
+            ([(1, 1000), (2, nil)], 1000), ([(1, 1000)], -1), ([(1, 1000)], nil), ([], 1000)
+        ]
+        for (index, vector) in fpVectors.enumerated() {
+            let swiftResult = mailFingerprintFilter(vector.0, ds: vector.1)
+            let swiftJSON = swiftResult.map { "[" + $0.map(String.init).joined(separator: ",") + "]" } ?? "null"
+            let candsJS = "[" + vector.0.map { "{id: \($0.id), ds: \($0.ds.map(String.init) ?? "null")}" }
+                .joined(separator: ",") + "]"
+            t.equal(swiftJSON, evalJS("fingerprintFilter(\(candsJS), \(vector.1.map(String.init) ?? "null"))"),
+                    "fingerprint: Swift and JS agree on vector \(index)")
+        }
+
+        // Stability: after a completed move, OK needs the same OK state on the
+        // last two observations, at least rescueStableGap seconds apart.
+        let okState = st([], [601], [])
+        func sv(_ obs: [(TimeInterval, RescueState)], _ move: RescueMove = .moved) -> RescueStatus {
+            rescueStableVerdict(rowID: 500, watermark: 600, move: move,
+                                observations: obs.map { (at: $0.0, state: $0.1) }).status
+        }
+        t.equal(sv([(0, okState), (5, okState)]), .movedLocally, "stable: same OK state twice 5s apart is OK")
+        t.equal(sv([(0, okState)]), .unknown, "stable: OK seen once is not confirmed")
+        t.equal(sv([(0, okState), (5, st([], [601], [602]))]), .unknown,
+                "stable: matched once then changed (Trash copy appeared) is not OK")
+        t.equal(sv([(0, okState), (5, st([500], [], []))]), .unknown,
+                "stable: matched once then back in Recovered is not OK")
+        t.equal(sv([(0, okState), (5, st([], [602], []))]), .unknown,
+                "stable: OK twice but a different All Mail copy each time is not OK")
+        t.equal(sv([(0, okState), (4.9, okState)]), .unknown, "stable: two OK looks under 5s apart is not OK")
+        t.equal(sv([(0, okState), (5, okState), (10, st([], [], []))]), .unknown,
+                "stable: confirmed OK that later changes is judged on the latest pair")
+        t.equal(sv([(0, st([], [601], [602])), (5, okState), (10, okState)]), .movedLocally,
+                "stable: a transient All Mail + Trash state that settles to OK is OK")
+        t.equal(sv([(0, st([500], [], [])), (5, st([500], [], []))]), .stillInRecovered,
+                "stable: still in Recovered on two looks is STILL_IN_RECOVERED")
+        t.equal(sv([(0, st([500], [], [])), (5, okState)]), .unknown,
+                "stable: just changed to OK on the last look is not confirmed")
+        t.equal(sv([]), .unknown, "stable: no observation is unknown")
+        t.equal(sv([(0, okState), (5, okState)], .indeterminate("timed out")), .unknown,
+                "stable: a timed-out move stays UNKNOWN however stable the index is")
+        t.equal(sv([(0, st([500], [], []))], .notAttempted("refused")), .stillInRecovered,
+                "stable: a refused move needs one look only")
+
+        // Requests: apply takes exactly one explicit id and nothing else;
+        // nonsense limits are refused, not adjusted.
+        func req(apply: Bool, id: Int64? = nil, mid: String? = "m77@example.com", since: String? = nil,
+                 subject: String? = nil, limit: Int? = nil) -> RescueRequest? {
+            try? rescueRequest(apply: apply, id: id, messageID: mid, since: since, subject: subject, limit: limit)
+        }
+        t.equal(req(apply: true, id: 500), .apply(id: 500, messageID: "m77@example.com"),
+                "request: apply with an id and message_id moves just that id")
+        t.equal(req(apply: true, id: 500, mid: nil), nil, "request: apply without message_id is rejected")
+        t.equal(req(apply: true, id: 500, mid: " <> "), nil, "request: apply with an empty message_id is rejected")
+        t.equal(req(apply: true), nil, "request: apply without an id is rejected")
+        t.throwsError(matching: { $0.contains("explicit \"id\"") && $0.contains("nothing was moved") },
+                      "request: apply without an id says why") {
+            _ = try rescueRequest(apply: true, id: nil, messageID: "m77@example.com", since: nil, subject: nil, limit: nil)
+        }
+        t.equal(req(apply: true, id: 500, limit: 5), nil, "request: apply refuses a limit (no batches)")
+        t.equal(req(apply: true, id: 500, since: "2026-11-01"), nil, "request: apply refuses since")
+        t.equal(req(apply: true, id: 500, subject: "x"), nil, "request: apply refuses subject")
+        t.equal(req(apply: false), .list(id: nil, since: nil, subject: nil, limit: 50), "request: dry run lists 50 by default")
+        t.equal(req(apply: false, since: "2026-11-01", subject: "x", limit: 3),
+                .list(id: nil, since: "2026-11-01", subject: "x", limit: 3), "request: dry run keeps its filters")
+        t.equal(req(apply: false, limit: 0), nil, "request: limit 0 is refused, not turned into 1")
+        t.equal(req(apply: false, limit: -2), nil, "request: negative limit is refused")
+
+        // MCP integer arguments: exact integers only, never truncated.
+        func intArg(_ json: String) -> String {
+            let parsed = (try? JSONSerialization.jsonObject(with: Data("{\"id\": \(json)}".utf8))) as? [String: Any]
+            do { return (try strictInt64Argument(parsed?["id"], name: "id")).map(String.init) ?? "absent" }
+            catch { return "error" }
+        }
+        t.equal(intArg("50442"), "50442", "int arg: an integer passes through")
+        t.equal(intArg("500.9"), "error", "int arg: 500.9 is rejected, not truncated to 500")
+        t.equal(intArg("-0.5"), "error", "int arg: a fraction is rejected")
+        t.equal(intArg("\"500\""), "error", "int arg: a string is rejected")
+        t.equal(intArg("true"), "error", "int arg: a boolean is rejected")
+        t.equal(intArg("1e30"), "error", "int arg: out of Int64 range is rejected")
+        t.equal(intArg("9223372036854775808"), "error", "int arg: Int64.max + 1 is rejected")
+        t.equal(intArg("9223372036854775807"), "9223372036854775807", "int arg: Int64.max passes")
+        t.equal(intArg("null"), "absent", "int arg: null is absent")
+        t.equal((try? strictInt64Argument(nil, name: "id")).map { $0.map(String.init) ?? "absent" }, "absent",
+                "int arg: missing is absent")
+
+        // ...and the MCP dispatch really uses it (dry run only: even a
+        // regression here could at most list, never move).
+        func dispatch(_ args: [String: Any]) -> (isError: Bool, text: String) {
+            var reply: [String: Any] = [:]
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                reply = await MCPServer().callTool(params: ["name": "mail_rescue_recovered", "arguments": args])
+                done.signal()
+            }
+            done.wait()
+            let text = ((reply["content"] as? [[String: Any]])?.first?["text"] as? String) ?? ""
+            return ((reply["isError"] as? Bool) ?? false, text)
+        }
+        let fractional = dispatch(["id": NSNumber(value: 500.9), "apply": false])
+        t.check(fractional.isError && fractional.text.contains("exact integer"),
+                "mcp: id 500.9 is rejected by mail_rescue_recovered, not truncated")
+        let stringID = dispatch(["id": "500", "apply": false])
+        t.check(stringID.isError && stringID.text.contains("must be an integer"),
+                "mcp: a string id is rejected by mail_rescue_recovered")
+
+        // Local-only claim: the status name and message say so.
+        t.equal(RescueStatus.movedLocally.rawValue, "MOVED_LOCALLY", "status: success is named MOVED_LOCALLY")
+        t.check(rescueVerdict(rowID: 500, watermark: 600, move: .moved, state: okState).message
+                    .contains("does not mean the Gmail server has synced"),
+                "status: MOVED_LOCALLY says it is not proof of server sync")
+
+        // One observation = one statement over all three mailboxes, on a
+        // fixture index (Recovered=23, All Mail=15, Trash=21, INBOX=16).
+        let fixture = NSTemporaryDirectory() + "mac-kit-selftest-\(getpid()).sqlite"
+        try? FileManager.default.removeItem(atPath: fixture)
+        var writer: OpaquePointer?
+        if sqlite3_open(fixture, &writer) == SQLITE_OK {
+            sqlite3_exec(writer, """
+                CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, mailbox INTEGER,
+                                       date_sent INTEGER, deleted INTEGER, subject INTEGER,
+                                       sender INTEGER, date_received INTEGER);
+                CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+                CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+                CREATE TABLE message_global_data (message_id INTEGER, message_id_header TEXT);
+                INSERT INTO subjects VALUES (1, 'Cruise deals');
+                INSERT INTO addresses VALUES (1, 'a@example.com', 'A');
+                INSERT INTO message_global_data VALUES (77, '<m77@example.com>');
+                INSERT INTO message_global_data VALUES (99, '<m99@example.com>');
+                INSERT INTO messages VALUES (500, 77, 23, 1000, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (510, 99, 23, 3000, 0, 1, 1, 4000);
+                INSERT INTO messages VALUES (601, 77, 15, 1001, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (602, 77, 15, 1000, 1, 1, 1, 2000);
+                INSERT INTO messages VALUES (603, 77, 21, 5000, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (604, 77, 16, 1000, 0, 1, 1, 2000);
+                INSERT INTO messages VALUES (605, 88, 15, 1000, 0, 1, 1, 2000);
+                """, nil, nil, nil)
+        }
+        sqlite3_close(writer)
+        let fixtureBoxes = MailStore.RescueBoxes(recovered: 23, allMail: 15, trash: 21,
+                                                 accountUUID: "X", allMailPath: rescueAllMailPath)
+        if let fixtureDB = try? ReadOnlyDB(path: fixture) {
+            let before = fixtureDB.queryCount
+            let observed = rescueObserve(db: fixtureDB, boxes: fixtureBoxes, messageHash: 77, dateSent: 1000)
+            t.equal(fixtureDB.queryCount - before, 1, "snapshot: one observation runs exactly one statement")
+            t.equal(observed, st([500], [601], []),
+                    "snapshot: rows split per mailbox (deleted All Mail copy, other Date, INBOX and other Message-IDs ignored)")
+            // apply's lookup: only the named row, only from Recovered.
+            let named = (try? rescueRecoveredRows(db: fixtureDB, box: 23, id: 500, limit: 1)) ?? []
+            t.equal(named.map { $0.id }, [500], "apply lookup: returns only the named Recovered row")
+            t.equal(named.first?.header, "m77@example.com", "apply lookup: carries its Message-ID")
+            t.equal(((try? rescueRecoveredRows(db: fixtureDB, box: 23, id: 601, limit: 1)) ?? []).count, 0,
+                    "apply lookup: an id outside Recovered is not found")
+            t.equal(((try? rescueRecoveredRows(db: fixtureDB, box: 23, limit: 50)) ?? []).map { $0.id }, [510, 500],
+                    "dry run lookup: lists every Recovered row, newest first")
+        } else {
+            t.check(false, "snapshot: fixture index could not be opened")
+        }
+        try? FileManager.default.removeItem(atPath: fixture)
+        t.check(rescueObserveSQL.contains("mailbox IN (?, ?, ?)"), "snapshot: the observation SQL covers all three mailboxes")
+        t.equal(rescuePartition([(id: 500, mailbox: 23, ds: nil, deleted: false)], boxes: fixtureBoxes, dateSent: 1000),
+                st(nil, [], []), "partition: an unreadable Date fails only that mailbox closed")
+        t.equal(rescuePartition([(id: 503, mailbox: 21, ds: 1000, deleted: true)], boxes: fixtureBoxes, dateSent: 1000),
+                st([], [], [503]), "partition: a deleted Trash copy still counts")
+
+        // Identity: the index-side path that the script is asked to match.
+        t.equal(MailStore.mailboxPath(fromURL: "imap://A4273468-266C-4001-B575-AE2F5FFF0D66/%5BGmail%5D/All%20Mail"),
+                "[Gmail]/All Mail", "mailbox path: full decoded path from the index URL")
+        t.equal(MailStore.mailboxPath(fromURL: "imap://A4273468-266C-4001-B575-AE2F5FFF0D66/INBOX"), "INBOX",
+                "mailbox path: top-level mailbox")
+
+        // JXA pick inside Recovered.
+        js.evaluateScript(rescuePickJS)
+        t.equal(evalJS("rescuePick([{id: 500, ds: 1000}], 1000, 500)"), "\"ok\"", "rescue pick: sole match is the row")
+        t.equal(evalJS("rescuePick([{id: 501, ds: 1000}], 1000, 500)"), "\"mismatch\"", "rescue pick: other row refuses")
+        t.equal(evalJS("rescuePick([{id: 500, ds: 1000}, {id: 501, ds: 1000}], 1000, 500)"), "\"ambiguous\"",
+                "rescue pick: two matches refuse")
+        t.equal(evalJS("rescuePick([{id: 500, ds: 9000}], 1000, 500)"), "\"none\"", "rescue pick: wrong Date refuses")
+        t.equal(evalJS("rescuePick([{id: 500, ds: null}], 1000, 500)"), "\"unknown\"", "rescue pick: unreadable Date refuses")
+
+        let rescueScript = mailRescueScript(jobJSON: "{}")
+        let rescueParser = JSContext()!
+        rescueParser.evaluateScript("var parsed = typeof (function () {\n" + rescueScript + "\n; return run; })")
+        t.check(rescueParser.exception == nil,
+                "mail_rescue_recovered script parses (\(rescueParser.exception?.toString() ?? "ok"))")
+        t.check(rescueScript.contains("function rescuePick(") && rescueScript.contains("function fingerprintFilter("),
+                "mail_rescue_recovered script embeds the tested pick")
+        t.check(!rescueScript.contains("Mail.delete") && !rescueScript.contains(".delete("),
+                "mail_rescue_recovered script never deletes")
+        t.check(rescueScript.contains("Mail.accounts.whose({id: job.accountId})")
+                    && rescueScript.contains("path === job.allMailPath")
+                    && !rescueScript.contains("job.account)") && !rescueScript.contains("=== 'All Mail'"),
+                "mail_rescue_recovered script pins account by id and All Mail by full path, not by name")
 
         try t.finish()
     }

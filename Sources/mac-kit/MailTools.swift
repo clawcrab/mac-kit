@@ -12,6 +12,8 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 
 final class ReadOnlyDB {
     private var handle: OpaquePointer?
+    /// Statements run so far (self-test uses it to check one-snapshot reads).
+    private(set) var queryCount = 0
 
     init(path: String) throws {
         var db: OpaquePointer?
@@ -39,6 +41,7 @@ final class ReadOnlyDB {
     /// Values come back as text/int/null (Mail's schema uses no blobs we need).
     func query(_ sql: String, _ bindings: [Value] = []) throws -> [[Value]] {
         guard let handle else { throw ToolError("Database is closed") }
+        queryCount += 1
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw ToolError("SQL prepare failed: \(String(cString: sqlite3_errmsg(handle)))")
@@ -85,7 +88,7 @@ final class ReadOnlyDB {
     }
 }
 
-private extension ReadOnlyDB.Value {
+extension ReadOnlyDB.Value {
     var stringValue: String? {
         switch self {
         case .text(let string): return string
@@ -695,7 +698,7 @@ private let mailDateFormatter: DateFormatter = {
     return formatter
 }()
 
-private func formatEpoch(_ epoch: Int64) -> String {
+func formatEpoch(_ epoch: Int64) -> String {
     guard epoch > 0 else { return "?" }
     return mailDateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(epoch)))
 }
@@ -711,7 +714,7 @@ private func formatRow(_ row: MailStore.MessageRow, store: MailStore, index: Int
     """
 }
 
-private func parseSinceDate(_ since: String) throws -> Int64 {
+func parseSinceDate(_ since: String) throws -> Int64 {
     let iso = ISO8601DateFormatter()
     if let date = iso.date(from: since) {
         return Int64(date.timeIntervalSince1970)
