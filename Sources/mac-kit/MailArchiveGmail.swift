@@ -385,9 +385,9 @@ struct GmailArchiveTiming {
     var settleWindow: TimeInterval = 45
     /// How long the archived state must hold unchanged before it counts.
     var stableGap: TimeInterval = 2
-    /// Retries of a refile Mail.app refused without acting (its scripting
-    /// model can lag the index by a moment).
-    var refileAttempts = 3
+    /// How long to keep retrying a refile Mail.app refused without acting
+    /// (its scripting model can lag the index).
+    var refileWindow: TimeInterval = 20
 }
 
 /// Everything the run touches, injectable so self-test can drive it.
@@ -403,8 +403,11 @@ struct GmailArchiveEnv {
 struct GmailArchiveResult: Equatable {
     let status: MailArchiveStatus
     let message: String
-    /// A Mail.app call threw or timed out: the caller stops sending it work.
-    var mailAppFailed = false
+    /// The message was (or may have been) deleted from INBOX and the run did
+    /// not end in a confirmed archive: the caller must not delete anything
+    /// else. Whatever went wrong — Mail.app stuck, the server not answering —
+    /// would most likely strand the next message in Trash too.
+    var stopBatch = false
 }
 
 /// The message for an end state that is not "archived".
@@ -453,16 +456,15 @@ func gmailArchiveRun(id: Int64, env: GmailArchiveEnv, timing: GmailArchiveTiming
         if after == before {
             return GmailArchiveResult(status: .error, message: "not archived: \(reason) — nothing was changed")
         }
-        return GmailArchiveResult(status: .unknown, message: "not archived (\(reason)), but the mail index no longer looks as before \(after.summary) — check in Gmail")
+        return GmailArchiveResult(status: .unknown, message: "not archived (\(reason)), but the mail index no longer looks as before \(after.summary) — check in Gmail", stopBatch: true)
     }
-    let failedCall = deleted != .done
 
     // The delete settles asynchronously: the Trash copy takes a moment to
     // appear in the index, and longer to be acknowledged by the server. Only
     // a copy created after the watermark counts as this delete's arrival, and
     // it is only refiled once the server has acknowledged it — moving a
-    // local-only Trash row is how mail ends up in Recovered Messages. Even when the delete call itself failed or
-    // timed out the arrival is still watched for, because a message left in
+    // local-only Trash row is how mail ends up in Recovered Messages. Even
+    // when the delete call itself failed or timed out the arrival is still watched for, because a message left in
     // Trash is the worse outcome — but such a run can no longer end in OK.
     var trashID: Int64?
     var state = before
@@ -472,7 +474,7 @@ func gmailArchiveRun(id: Int64, env: GmailArchiveEnv, timing: GmailArchiveTiming
         if let fresh = gmailArchiveNewCopies(state.trash, watermark: watermark) {
             if fresh.count == 1, state.synced?.contains(fresh[0]) == true { trashID = fresh[0]; break }
             if fresh.count > 1 {
-                return GmailArchiveResult(status: .ambiguous, message: "after deleting from INBOX: several new Trash copies carry this fingerprint — nothing was refiled, check in Gmail \(state.summary)", mailAppFailed: failedCall)
+                return GmailArchiveResult(status: .ambiguous, message: "after deleting from INBOX: several new Trash copies carry this fingerprint — nothing was refiled, check in Gmail \(state.summary)", stopBatch: true)
             }
         }
         if env.now() - deleteReturned >= timing.arrivalWindow { break }
@@ -480,24 +482,23 @@ func gmailArchiveRun(id: Int64, env: GmailArchiveEnv, timing: GmailArchiveTiming
     }
     guard let trashID else {
         if case .indeterminate(let reason) = deleted {
-            return GmailArchiveResult(status: .unknown, message: "the delete from INBOX failed or timed out (\(reason)) and no new Trash copy appeared within \(Int(timing.arrivalWindow))s — state unknown, check in Gmail before retrying \(state.summary)", mailAppFailed: true)
+            return GmailArchiveResult(status: .unknown, message: "the delete from INBOX failed or timed out (\(reason)) and no new Trash copy appeared within \(Int(timing.arrivalWindow))s — state unknown, check in Gmail before retrying \(state.summary)", stopBatch: true)
         }
         if gmailArchiveNewCopies(state.trash, watermark: watermark)?.count == 1 {
-            return GmailArchiveResult(status: .error, message: "deleted from INBOX, but the server did not confirm the new Trash copy within \(Int(timing.arrivalWindow))s, so it was not refiled — it is in Trash, not archived; recover it from Gmail Trash \(state.summary)")
+            return GmailArchiveResult(status: .unknown, message: "deleted from INBOX, but the server did not confirm the new Trash copy within \(Int(timing.arrivalWindow))s (offline or slow?), so it was not refiled — not archived; locally it is in Trash, on Gmail it may still be in INBOX or already in Trash, check in Gmail \(state.summary)", stopBatch: true)
         }
-        return GmailArchiveResult(status: .unknown, message: "deleted from INBOX, but no new Trash copy was seen within \(Int(timing.arrivalWindow))s, so nothing was refiled — state unknown, check in Gmail before retrying \(state.summary)")
+        return GmailArchiveResult(status: .unknown, message: "deleted from INBOX, but no new Trash copy was seen within \(Int(timing.arrivalWindow))s, so nothing was refiled — state unknown, check in Gmail before retrying \(state.summary)", stopBatch: true)
     }
 
     // Refile: drops the Trash label -> archived in All Mail. A refusal
-    // changed nothing, so it is retried a couple of times.
+    // changed nothing (typically Mail.app's scripting model does not show
+    // the Trash row yet), so it is retried for refileWindow.
+    let refileStarted = env.now()
     var refiled = env.refile(trashID)
-    var attempt = 1
-    while case .notAttempted = refiled, attempt < timing.refileAttempts {
+    while case .notAttempted = refiled, env.now() - refileStarted < timing.refileWindow {
         env.sleep(1)
         refiled = env.refile(trashID)
-        attempt += 1
     }
-    let anyFailed = failedCall || { if case .indeterminate = refiled { return true } else { return false } }()
 
     // The refile settles asynchronously too, and the index passes through
     // transient states (All Mail and Trash both listed). Poll until
@@ -541,13 +542,13 @@ func gmailArchiveRun(id: Int64, env: GmailArchiveEnv, timing: GmailArchiveTiming
         // and never as success.
         let shown = gmailArchiveVerdict(final)
         if shown == .archived || shown == .unknown {
-            return GmailArchiveResult(status: .unknown, message: prefix + "state unknown even if the mail index looks fine, check in Gmail before retrying \(final.summary)", mailAppFailed: anyFailed)
+            return GmailArchiveResult(status: .unknown, message: prefix + "state unknown even if the mail index looks fine, check in Gmail before retrying \(final.summary)", stopBatch: true)
         }
         let (status, message) = gmailArchiveFailure(shown, state: final, prefix: prefix)
-        return GmailArchiveResult(status: status, message: message, mailAppFailed: anyFailed)
+        return GmailArchiveResult(status: status, message: message, stopBatch: true)
     }
     let (status, message) = gmailArchiveFailure(verdict, state: final, prefix: prefix)
-    return GmailArchiveResult(status: status, message: message, mailAppFailed: anyFailed)
+    return GmailArchiveResult(status: status, message: message, stopBatch: true)
 }
 
 /// The real environment for one message: index reads through `store`,

@@ -1316,20 +1316,21 @@ func mailArchiveText(ids requested: [Int64]) throws -> String {
     }
 
     // Gmail: one message at a time, each judged from the index. Once a
-    // Mail.app call has failed or timed out, the rest of the batch is not
-    // attempted — a stuck Mail.app is how mail ends up stranded in Trash.
-    var mailAppFailedAt: Int64?
+    // message has been deleted from INBOX without ending in a confirmed
+    // archive, the rest of the batch is not attempted — whatever went wrong
+    // (Mail.app stuck, Gmail not answering) would strand those in Trash too.
+    var stoppedAt: Int64?
     for job in gmailJobs {
-        if let failedAt = mailAppFailedAt {
+        if let stoppedAt {
             results[job.id] = Outcome(id: job.id, status: .unknown,
-                message: "not attempted: a Mail.app call failed or timed out earlier in this batch (message \(failedAt)) — nothing was changed for this message")
+                message: "not attempted: message \(stoppedAt), earlier in this batch, was taken out of INBOX but its archive could not be confirmed — nothing was changed for this message")
             continue
         }
         let env = gmailArchiveLiveEnv(id: job.id, messageID: job.mid, messageHash: job.hash, dateSent: job.ds,
                                       store: store, boxes: job.boxes)
         let result = gmailArchiveRun(id: job.id, env: env)
         results[job.id] = Outcome(id: job.id, status: result.status, message: result.message)
-        if result.mailAppFailed { mailAppFailedAt = job.id }
+        if result.stopBatch { stoppedAt = job.id }
     }
 
     let ordered = ids.map { results[$0] ?? Outcome(id: $0, status: .unknown, message: "no result") }

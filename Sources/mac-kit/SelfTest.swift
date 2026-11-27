@@ -644,6 +644,7 @@ struct SelfTestCommand: ParsableCommand {
             var elapsed: TimeInterval
         }
         func simulate(delete: GmailArchiveStep = .done, refile: GmailArchiveStep = .done, watermark: Int64? = 500,
+                      refileScript: (() -> GmailArchiveStep)? = nil,
                       world: @escaping (_ sinceDelete: TimeInterval?, _ sinceRefile: TimeInterval?) -> GmailArchiveState) -> ArchiveSim {
             var clock: TimeInterval = 0
             var deletedAt: TimeInterval?, refiledAt: TimeInterval?
@@ -653,7 +654,12 @@ struct SelfTestCommand: ParsableCommand {
                 watermark: { watermark },
                 observe: { world(deletedAt.map { clock - $0 }, refiledAt.map { clock - $0 }) },
                 delete: { deletes += 1; if delete != .notAttempted("refused") { deletedAt = clock }; return delete },
-                refile: { id in refiledIDs.append(id); if refile == .done { refiledAt = clock }; return refile },
+                refile: { id in
+                    refiledIDs.append(id)
+                    let step = refileScript?() ?? refile
+                    if step == .done { refiledAt = clock }
+                    return step
+                },
                 now: { clock },
                 sleep: { clock += $0 })
             let result = gmailArchiveRun(id: 500, env: env)
@@ -704,7 +710,7 @@ struct SelfTestCommand: ParsableCommand {
             return sinceDelete < 2 ? gs([], [500], []) : gs([], [], [501], local: [501])
         }
         t.equal(trashNeverAcked.refiledIDs, [], "run: a Trash copy the server never acknowledges is never refiled")
-        t.equal(trashNeverAcked.result.status, .error, "run: an unacknowledged Trash copy is reported as left in Trash")
+        t.equal(trashNeverAcked.result.status, .unknown, "run: an unacknowledged Trash copy is UNKNOWN (the server may not have it there)")
         t.check(trashNeverAcked.result.message.contains("Trash"), "run: ...and the result says where it is")
 
         let neverLands = simulate { sinceDelete, sinceRefile in
@@ -745,6 +751,7 @@ struct SelfTestCommand: ParsableCommand {
         t.equal(twoArrivals.result.status, .ambiguous, "run: two new Trash copies are AMBIGUOUS")
         t.equal(twoArrivals.refiledIDs, [], "run: nothing is refiled when the arrival is ambiguous")
 
+        let notInInboxEarly = simulate { _, _ in gs([], [500], []) }
         let deleteRefused = simulate(delete: .notAttempted("refused")) { _, _ in inInbox }
         t.equal(deleteRefused.result.status, .error, "run: a refused delete is an ERROR")
         t.check(deleteRefused.result.message.contains("nothing was changed") && deleteRefused.refiledIDs.isEmpty,
@@ -752,19 +759,32 @@ struct SelfTestCommand: ParsableCommand {
         let deleteTimedOut = simulate(delete: .indeterminate("timed out"), world: healthy)
         t.equal(deleteTimedOut.result.status, .unknown, "run: a timed-out delete is UNKNOWN even when the index ends up archived")
         t.equal(deleteTimedOut.refiledIDs, [501], "run: a timed-out delete's Trash arrival is still refiled, not stranded")
-        t.check(deleteTimedOut.result.mailAppFailed, "run: a timed-out delete stops the rest of the batch")
+        t.check(deleteTimedOut.result.stopBatch, "run: a timed-out delete stops the rest of the batch")
         let refileTimedOut = simulate(refile: .indeterminate("timed out")) { sinceDelete, _ in
             // the refile is never marked as returned, so model its effect by time since the delete
             guard let sinceDelete else { return inInbox }
             return sinceDelete < 2 ? gs([], [500], []) : (sinceDelete < 4 ? gs([], [], [501]) : gs([], [502], []))
         }
         t.equal(refileTimedOut.result.status, .unknown, "run: a timed-out refile is UNKNOWN even when the index ends up archived")
-        t.check(refileTimedOut.result.mailAppFailed, "run: a timed-out refile stops the rest of the batch")
+        t.check(refileTimedOut.result.stopBatch, "run: a timed-out refile stops the rest of the batch")
         let refileRefused = simulate(refile: .notAttempted("not found")) { sinceDelete, _ in healthy(sinceDelete, nil) }
         t.equal(refileRefused.result.status, .error, "run: a refused refile leaves it in Trash: ERROR")
         t.check(refileRefused.result.message.contains("Trash"), "run: a refused refile says the message is in Trash")
-        t.equal(refileRefused.refiledIDs, [501, 501, 501], "run: a refused refile is retried, then given up")
-        t.check(!refileRefused.result.mailAppFailed, "run: a refusal is not a Mail.app failure")
+        t.check(refileRefused.refiledIDs.count >= 20 && Set(refileRefused.refiledIDs) == [501],
+                "run: a refused refile is retried for the whole refile window, then given up (\(refileRefused.refiledIDs.count) tries)")
+        t.check(refileRefused.result.stopBatch, "run: a message left in Trash stops the rest of the batch")
+        // Mail.app's scripting model shows the Trash row only 6s after the index does.
+        var refusals = 0
+        let lateModel = simulate(refileScript: { refusals += 1; return refusals <= 6 ? .notAttempted("not found") : .done }, world: healthy)
+        t.equal(lateModel.result.status, .ok, "run: a refile refused for a few seconds is retried until Mail.app sees the row")
+        t.check(!good.result.stopBatch && !deleteRefused.result.stopBatch && !notInInboxEarly.result.stopBatch,
+                "run: an OK, a refused delete and a not-in-INBOX message do not stop the batch")
+        for (name, sim) in [("gone everywhere", neverLands), ("quarantined", quarantine), ("still in Trash", lagging),
+                            ("no arrival", noArrival), ("two arrivals", twoArrivals), ("Trash never acknowledged", trashNeverAcked),
+                            ("All Mail never acknowledged", neverAcked)] {
+            t.check(sim.result.status != .ok && sim.result.stopBatch,
+                    "run: \(name) — taken out of INBOX without a confirmed archive — stops the rest of the batch")
+        }
 
         let notInInbox = simulate { _, _ in gs([], [500], []) }
         t.equal(notInInbox.result.status, .error, "run: a message that is not in INBOX is an ERROR")
