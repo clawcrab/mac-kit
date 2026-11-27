@@ -317,7 +317,7 @@ struct MCPServer {
         ],
         [
             "name": "mail_archive",
-            "description": "Move one or more messages OUT of the INBOX to the account's archive (Archive mailbox for standard IMAP; \"All Mail\" for Gmail, which just drops the INBOX label). Reversible — never deletes. Ids are the [id] values from mail_search/mail_unread. Returns a per-id status: OK, ERROR, AMBIGUOUS (Mail.app index contradicts itself; check in Gmail) or UNKNOWN (state could not be determined). Only OK is success.",
+            "description": "Move one or more messages OUT of the INBOX to the account's archive (Archive mailbox for standard IMAP; \"All Mail\" for Gmail, which just drops the INBOX label). Reversible — never deletes. Ids are the [id] values from mail_search/mail_unread. Returns a per-id status: OK, ERROR, AMBIGUOUS (Mail.app index contradicts itself; check in Gmail) or UNKNOWN (state could not be determined). Only OK is success. Gmail messages take about 10s each and are judged from Mail.app's local index: OK means it shows the message in All Mail and not in INBOX or Trash. A message that ended up in \"Recovered Messages\" is an ERROR (see mail_rescue_recovered).",
             "inputSchema": [
                 "type": "object",
                 "properties": [
