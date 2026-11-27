@@ -49,7 +49,7 @@ let rescueRecoveredMailboxName = "Recovered Messages (\(rescueAccountName))"
 let rescueAllMailPath = "[Gmail]/All Mail"
 let rescueTrashPath = "[Gmail]/Trash"
 
-/// Swift twin of `fingerprintFilter` in gmailArchiveCriterionJS (self-test
+/// Swift twin of `fingerprintFilter` in mailFingerprintJS (self-test
 /// cross-checks the two on the same vectors so they cannot drift): the ids of
 /// the candidates whose Date is within a second of `ds`, or nil — fail
 /// closed — when the target's or any candidate's Date is unknown.
@@ -224,7 +224,7 @@ func mailRescueScript(jobJSON json: String) -> String {
     function run() {
       const Mail = Application('Mail');
       const job = JSON.parse(\(jsLiteral(json)));
-      \(gmailArchiveCriterionJS)
+      \(mailFingerprintJS)
       \(rescuePickJS)
       let target = null, allmail = null;
       // "[Gmail]/All Mail": the mailbox name prefixed by its parent folders

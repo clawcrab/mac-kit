@@ -324,46 +324,55 @@ struct SelfTestCommand: ParsableCommand {
 
         // MARK: mail_archive Gmail criterion (target state reached, not symptom gone)
         //
-        // gmailArchiveCriterionJS is the exact source the archive script runs
-        // in Mail.app; evaluate it here under JavaScriptCore. Verdict arguments
-        // are the Mail.app ids of the fingerprint-matching copies per mailbox.
+        // State arguments are the Envelope Index ROWIDs of the
+        // fingerprint-matching copies per place. Row 500 is the caller's
+        // message; the watermark is 500, so copies this run creates are 501+.
 
+        // Unless `local` names them, every All Mail / Trash copy is
+        // server-acknowledged (has a UID), as settled rows are.
+        func gs(_ inbox: [Int64]?, _ allMail: [Int64]?, _ trash: [Int64]?, _ recovered: [Int64]? = [],
+                local: [Int64] = []) -> GmailArchiveState {
+            GmailArchiveState(inbox: inbox, allMail: allMail, trash: trash, recovered: recovered,
+                              synced: ((allMail ?? []) + (trash ?? [])).filter { !local.contains($0) })
+        }
+        t.equal(gmailArchiveVerdict(gs([], [500], [])), .archived, "gmail verdict: in All Mail only is archived")
+        t.equal(gmailArchiveVerdict(gs([500], [500], [])), .inbox,
+                "gmail verdict: INBOX label still present is not archived")
+        t.equal(gmailArchiveVerdict(gs([], [], [501])), .trash, "gmail verdict: Trash only is left in Trash")
+        t.equal(gmailArchiveVerdict(gs([], [], [])), .missing,
+                "gmail verdict: nowhere is not archived (the old else-OK bug)")
+        t.equal(gmailArchiveVerdict(gs([], [], [], [502])), .recovered,
+                "gmail verdict: only in Recovered Messages is not archived")
+        t.equal(gmailArchiveVerdict(gs([], [502], [501])), .ambiguous,
+                "gmail verdict: copies in both All Mail and Trash are ambiguous (All Mail newer)")
+        t.equal(gmailArchiveVerdict(gs([], [500], [501])), .ambiguous,
+                "gmail verdict: copies in both All Mail and Trash are ambiguous (Trash newer)")
+        t.equal(gmailArchiveVerdict(gs([], [500, 503], [])), .ambiguous,
+                "gmail verdict: two fingerprint matches in All Mail are ambiguous")
+        t.equal(gmailArchiveVerdict(gs([], [], [501, 502])), .ambiguous,
+                "gmail verdict: two fingerprint matches in Trash are ambiguous")
+        t.equal(gmailArchiveVerdict(gs([500, 503], [500, 503], [])), .ambiguous,
+                "gmail verdict: two fingerprint matches in INBOX are ambiguous")
+        t.equal(gmailArchiveVerdict(gs([], nil, [])), .unknown,
+                "gmail verdict: a failed All Mail lookup is unknown, not missing")
+        t.equal(gmailArchiveVerdict(gs(nil, [500], [])), .unknown,
+                "gmail verdict: a failed INBOX lookup is unknown, not archived")
+        t.equal(gmailArchiveVerdict(gs([], [500], nil)), .unknown,
+                "gmail verdict: a failed Trash lookup is unknown, not archived")
+        t.equal(gmailArchiveVerdict(gs([], [500], [], nil)), .unknown,
+                "gmail verdict: a failed Recovered lookup is unknown, not archived")
+        t.equal(gmailArchiveVerdict(.unreadable), .unknown, "gmail verdict: no state is unknown")
+        t.equal(gmailArchiveVerdict(GmailArchiveState(inbox: [], allMail: [500], trash: [], recovered: [], synced: nil)), .unknown,
+                "gmail verdict: unreadable server acknowledgement is unknown")
+
+        // Fingerprint (Message-ID + Date), the JS twin the rescue script runs
+        // in Mail.app: fail closed when a Date is unreadable.
         let js = JSContext()!
         if #available(macOS 13.3, *) { js.isInspectable = false }
-        js.evaluateScript(gmailArchiveCriterionJS)
+        js.evaluateScript(mailFingerprintJS)
         func evalJS(_ expr: String) -> String {
             js.evaluateScript("JSON.stringify(\(expr))")?.toString() ?? "<nil>"
         }
-        func verdict(_ state: String) -> String {
-            js.evaluateScript("gmailArchiveVerdict(\(state))")?.toString() ?? "<nil>"
-        }
-        t.equal(verdict("{inbox: [], allMail: [500], trash: []}"), "archived",
-                "gmail verdict: in All Mail only is archived")
-        t.equal(verdict("{inbox: [500], allMail: [500], trash: []}"), "inbox",
-                "gmail verdict: INBOX label still present is not archived")
-        t.equal(verdict("{inbox: [], allMail: [], trash: [501]}"), "trash",
-                "gmail verdict: Trash only is left in Trash")
-        t.equal(verdict("{inbox: [], allMail: [], trash: []}"), "missing",
-                "gmail verdict: nowhere is not archived (the old else-OK bug)")
-        t.equal(verdict("{inbox: [], allMail: [502], trash: [501]}"), "ambiguous",
-                "gmail verdict: copies in both All Mail and Trash are ambiguous (All Mail newer)")
-        t.equal(verdict("{inbox: [], allMail: [500], trash: [501]}"), "ambiguous",
-                "gmail verdict: copies in both All Mail and Trash are ambiguous (Trash newer)")
-        t.equal(verdict("{inbox: [], allMail: [500, 503], trash: []}"), "ambiguous",
-                "gmail verdict: two fingerprint matches in All Mail are ambiguous")
-        t.equal(verdict("{inbox: [], allMail: [], trash: [501, 502]}"), "ambiguous",
-                "gmail verdict: two fingerprint matches in Trash are ambiguous")
-        t.equal(verdict("{inbox: [500, 503], allMail: [500, 503], trash: []}"), "ambiguous",
-                "gmail verdict: two fingerprint matches in INBOX are ambiguous")
-        t.equal(verdict("{inbox: [], allMail: null, trash: []}"), "unknown",
-                "gmail verdict: a failed All Mail lookup is unknown, not missing")
-        t.equal(verdict("{inbox: null, allMail: [500], trash: []}"), "unknown",
-                "gmail verdict: a failed INBOX lookup is unknown, not archived")
-        t.equal(verdict("{inbox: [], allMail: [500], trash: null}"), "unknown",
-                "gmail verdict: a failed Trash lookup is unknown, not archived")
-        t.equal(verdict("undefined"), "unknown", "gmail verdict: no state is unknown")
-
-        // Fingerprint (Message-ID + Date): fail closed when a Date is unreadable.
         t.equal(evalJS("fingerprintFilter([{id: 1, ds: 1000}, {id: 2, ds: 5000}], 1000)"), "[1]",
                 "fingerprint: same Message-ID, different Date is a different message")
         t.equal(evalJS("fingerprintFilter([{id: 1, ds: 1001}], 1000)"), "[1]",
@@ -377,56 +386,85 @@ struct SelfTestCommand: ParsableCommand {
         t.equal(evalJS("fingerprintFilter([{id: 1, ds: 1000}], null)"), "null",
                 "fingerprint: null target Date fails the lookup")
         t.equal(evalJS("fingerprintFilter([], 1000)"), "[]", "fingerprint: no candidates is empty")
+        t.check(js.exception == nil, "fingerprint: JS evaluated without exceptions")
 
-        // Pre-check before anything is deleted. `requested` is the INBOX lookup
-        // by the caller's exact row id; the fingerprint only verifies it.
-        func pre(_ requested: String, _ inbox: String, _ preTrash: String) -> String {
-            evalJS("gmailArchivePrecheck({id: 500, requested: \(requested), inbox: \(inbox), preTrash: \(preTrash)})")
-        }
-        t.equal(pre("[500]", "[500]", "[]"), "\"proceed\"",
+        // Pre-check before anything is deleted: the caller's exact row must be
+        // in INBOX, alone, with nothing in Trash.
+        t.equal(gmailArchivePrecheck(id: 500, state: gs([500], [500], [])), .proceed,
                 "precheck: the requested row in INBOX with a clean Trash baseline proceeds")
-        t.equal(pre("[]", "[503]", "[]"), "\"not-in-inbox\"",
+        t.equal(gmailArchivePrecheck(id: 500, state: gs([503], [500, 503], [])), .notInInbox,
                 "precheck: requested row not in INBOX refuses even if another fingerprint match is")
-        t.equal(pre("[500]", "[503]", "[]"), "\"mismatch\"",
-                "precheck: requested row does not carry the fingerprint refuses")
-        t.equal(pre("[500]", "[500, 503]", "[]"), "\"ambiguous\"",
+        t.equal(gmailArchivePrecheck(id: 500, state: gs([], [500], [])), .notInInbox,
+                "precheck: an already archived message is not touched")
+        t.equal(gmailArchivePrecheck(id: 500, state: gs([500, 503], [500, 503], [])), .ambiguous,
                 "precheck: a second INBOX fingerprint match refuses")
-        t.equal(pre("[500]", "[500]", "[480]"), "\"ambiguous\"",
+        t.equal(gmailArchivePrecheck(id: 500, state: gs([500], [500], [480])), .ambiguous,
                 "precheck: a Trash copy already present refuses")
-        t.equal(pre("[500]", "[500]", "null"), "\"unknown\"",
+        t.equal(gmailArchivePrecheck(id: 500, state: gs([500], [500], nil)), .unknown,
                 "precheck: failed Trash baseline aborts before deleting")
-        t.equal(pre("null", "[500]", "[]"), "\"unknown\"",
-                "precheck: failed lookup of the requested row aborts")
-        t.equal(pre("[500]", "null", "[]"), "\"unknown\"",
-                "precheck: failed INBOX fingerprint lookup aborts")
+        t.equal(gmailArchivePrecheck(id: 500, state: gs(nil, [500], [])), .unknown,
+                "precheck: failed INBOX lookup aborts")
+        t.equal(gmailArchivePrecheck(id: 500, state: .unreadable), .unknown,
+                "precheck: an unreadable index aborts")
 
         // Watermark: only copies created after the run started are ours.
-        t.equal(evalJS("newCopies([480, 501, 502], 500)"), "[501,502]",
+        t.equal(gmailArchiveNewCopies([480, 501, 502], watermark: 500), [501, 502],
                 "watermark: copies at or below the watermark are pre-existing")
-        t.equal(evalJS("newCopies([500], 500)"), "[]", "watermark: equal to the watermark is pre-existing")
-        t.equal(evalJS("newCopies(null, 500)"), "null", "watermark: failed lookup stays failed")
-        t.equal(evalJS("newCopies([501], undefined)"), "null", "watermark: no watermark fails closed")
+        t.equal(gmailArchiveNewCopies([500], watermark: 500), [], "watermark: equal to the watermark is pre-existing")
+        t.equal(gmailArchiveNewCopies(nil, watermark: 500), nil, "watermark: failed lookup stays failed")
 
-        // Outcome: OK only when this run saw the Trash copy arrive, refiled it,
-        // and the result is a single All Mail copy created by the refile.
-        func outcome(_ arrived: Bool, _ refiled: Bool, _ state: String) -> String {
-            evalJS("gmailArchiveOutcome({arrived: \(arrived), refiled: \(refiled), wm: 500, state: \(state)})")
+        // Outcome: OK only when this run's delete and refile both returned and
+        // the result is a single All Mail copy created by the refile.
+        func outcome(_ deleted: GmailArchiveStep, _ refiled: GmailArchiveStep?, _ state: GmailArchiveState) -> GmailArchiveVerdict {
+            gmailArchiveOutcome(deleted: deleted, refiled: refiled, watermark: 500, state: state)
         }
-        t.equal(outcome(true, true, "{inbox: [], allMail: [502], trash: []}"), "\"archived\"",
-                "outcome: arrival seen, refiled, new All Mail copy only is archived")
-        t.equal(outcome(false, false, "{inbox: [], allMail: [500], trash: []}"), "\"unknown\"",
-                "outcome: INBOX gone + All Mail present without a seen Trash arrival is unknown, not OK")
-        t.equal(outcome(true, false, "{inbox: [], allMail: [502], trash: []}"), "\"unknown\"",
-                "outcome: no refile performed is unknown")
-        t.equal(outcome(true, true, "{inbox: [], allMail: [500], trash: []}"), "\"unknown\"",
+        t.equal(outcome(.done, .done, gs([], [502], [])), .archived,
+                "outcome: deleted, refiled, new All Mail copy only is archived")
+        t.equal(outcome(.done, nil, gs([], [500], [])), .unknown,
+                "outcome: INBOX gone + All Mail present without a refile is unknown, not OK")
+        t.equal(outcome(.done, .notAttempted("refused"), gs([], [502], [])), .unknown,
+                "outcome: a refused refile is never OK")
+        t.equal(outcome(.done, .indeterminate("timed out"), gs([], [502], [])), .unknown,
+                "outcome: a timed-out refile is unknown even when the index looks archived")
+        t.equal(outcome(.indeterminate("timed out"), .done, gs([], [502], [])), .unknown,
+                "outcome: a timed-out delete is unknown even when the index looks archived")
+        t.equal(outcome(.done, .done, gs([], [500], [])), .unknown,
                 "outcome: the only All Mail copy predates the run (refile not landed) is unknown")
-        t.equal(outcome(true, true, "{inbox: [], allMail: [502], trash: [501]}"), "\"ambiguous\"",
+        t.equal(outcome(.done, .done, gs([], [502], [501])), .ambiguous,
                 "outcome: Trash copy still listed after refile is ambiguous")
-        t.equal(outcome(true, true, "{inbox: [], allMail: [], trash: [501]}"), "\"trash\"",
-                "outcome: refile did not take is left in Trash")
-        t.equal(outcome(true, true, "{inbox: [500], allMail: [500], trash: []}"), "\"inbox\"",
-                "outcome: still in INBOX is still in INBOX")
-        t.check(js.exception == nil, "gmail criterion: JS evaluated without exceptions")
+        t.equal(outcome(.done, .done, gs([], [], [501])), .trash, "outcome: refile did not take is left in Trash")
+        t.equal(outcome(.done, .done, gs([500], [500], [])), .inbox, "outcome: still in INBOX is still in INBOX")
+        t.equal(outcome(.done, .done, gs([], [502], [], local: [502])), .unknown,
+                "outcome: a new All Mail row the server has not acknowledged is unknown, not OK (the 2026-11-27 false OK)")
+        t.equal(outcome(.done, .done, gs([], [], [])), .missing,
+                "outcome: gone from every mailbox is missing, never OK")
+        t.equal(outcome(.done, .done, gs([], [], [], [502])), .recovered,
+                "outcome: only in Recovered Messages is never OK")
+        t.equal(outcome(.done, .done, gs([], [502], [], [503])), .recovered,
+                "outcome: an All Mail copy plus a new Recovered copy is not OK")
+        t.equal(outcome(.done, .done, gs([], [502], [], [480])), .archived,
+                "outcome: a Recovered copy that predates the run does not block a clean archive")
+        t.equal(outcome(.done, .done, gs([], [502], [], nil)), .unknown,
+                "outcome: an unreadable Recovered lookup is unknown")
+
+        // Stability: "archived" must hold unchanged for stableGap seconds.
+        func stable(_ obs: [(TimeInterval, GmailArchiveState)]) -> GmailArchiveVerdict {
+            gmailArchiveStableOutcome(deleted: .done, refiled: .done, watermark: 500,
+                                      observations: obs.map { (at: $0.0, state: $0.1) }, stableGap: 2)
+        }
+        let archivedState = gs([], [502], [])
+        t.equal(stable([(0, archivedState)]), .unknown, "stable: archived seen once is not confirmed")
+        t.equal(stable([(0, archivedState), (1.5, archivedState)]), .unknown,
+                "stable: archived for under stableGap is not confirmed")
+        t.equal(stable([(0, archivedState), (1, archivedState), (2, archivedState)]), .archived,
+                "stable: archived unchanged for stableGap is archived")
+        t.equal(stable([(0, gs([], [502], [501])), (1, archivedState), (3, archivedState)]), .archived,
+                "stable: a transient All Mail + Trash state that settles is archived")
+        t.equal(stable([(0, archivedState), (2, archivedState), (2.5, gs([], [503], []))]), .unknown,
+                "stable: a different All Mail copy restarts the clock")
+        t.equal(stable([(0, archivedState), (2, archivedState), (2.5, gs([502], [502], []))]), .inbox,
+                "stable: archived, then the INBOX label comes back, is still in INBOX")
+        t.equal(stable([]), .unknown, "stable: no observation is unknown")
 
         // Swift side: a Gmail job without a Date in the index is refused up front.
         t.check(mailArchiveRefusal(gmail: true, dateSent: nil, watermark: 60_000) != nil,
@@ -447,18 +485,319 @@ struct SelfTestCommand: ParsableCommand {
         t.equal(MailArchiveStatus(token: "ERR"), .error, "status: ERR is an error")
         t.equal(MailArchiveStatus(token: "garbage"), .error, "status: unrecognised token is never success")
 
-        // The whole archive script (with the criterion spliced in) must at least
-        // parse; JXA would otherwise fail every archive at run time. Parse only:
-        // the script is wrapped in a function that is never called.
-        let parser = JSContext()!
-        let script = mailArchiveScript(jobsJSON: "[]", scriptBudget: 80, watermark: 60_000)
-        parser.evaluateScript("var parsed = typeof (function () {\n" + script + "\n; return run; })")
-        t.check(parser.exception == nil,
-                "mail_archive script parses (\(parser.exception?.toString() ?? "ok"))")
-        t.check(script.contains("function gmailArchiveVerdict(") && script.contains("function fingerprintFilter(")
-                    && script.contains("function gmailArchivePrecheck(")
-                    && script.contains("function gmailArchiveOutcome(") && script.contains("function newCopies("),
-                "mail_archive script embeds the tested criterion")
+        // Action script replies: only a clean DONE is a completed call.
+        t.equal(gmailArchiveStep(fromScriptOutput: "DONE"), .done, "archive reply: DONE")
+        t.equal(gmailArchiveStep(fromScriptOutput: "SKIP\tnot there"), .notAttempted("not there"),
+                "archive reply: SKIP is not attempted")
+        t.check(gmailArchiveStep(fromScriptOutput: "ERR\t-1728") != .done, "archive reply: ERR is not done")
+        t.check(gmailArchiveStep(fromScriptOutput: "") != .done, "archive reply: empty is not done")
+        t.check(gmailArchiveStep(fromScriptOutput: "DONE\textra") != .done, "archive reply: DONE with a tail is not done")
+        t.check(gmailArchiveStep(fromScriptOutput: "DONE?") != .done, "archive reply: garbage is not done")
+
+        // The scripts must at least parse; JXA would otherwise fail every
+        // archive at run time. Parse only: each is wrapped in a function that
+        // is never called.
+        func parses(_ script: String) -> String? {
+            let parser = JSContext()!
+            parser.evaluateScript("var parsed = typeof (function () {\n" + script + "\n; return run; })")
+            return parser.exception?.toString()
+        }
+        let script = mailArchiveScript(jobsJSON: "[]")
+        t.check(parses(script) == nil, "mail_archive script parses (\(parses(script) ?? "ok"))")
+        t.check(!script.contains("Mail.delete") && !script.contains("All Mail"),
+                "mail_archive script is the standard IMAP path only")
+        let actionScript = gmailArchiveActionScript(jobJSON: "{}")
+        t.check(parses(actionScript) == nil, "gmail archive action script parses (\(parses(actionScript) ?? "ok"))")
+        // The regression this guards: a `whose({messageId: …})` over All Mail
+        // takes ~42s in Mail.app. The Gmail path may only look a message up by
+        // id, in the source mailbox, and never observes through Mail.app.
+        t.equal(actionScript.components(separatedBy: "messageId:").count - 1, 1,
+                "gmail archive action script has exactly one Message-ID search")
+        t.check(actionScript.contains("checks[0].messages.whose({messageId: job.mid})")
+                    && actionScript.contains("job.op === 'delete' && path === job.checkPath")
+                    && !actionScript.contains("byId"),
+                "gmail archive action script's Message-ID search is the Trash baseline before a delete (and no unscoped byId)")
+        t.check(actionScript.contains("srcs[0].messages.whose({id: job.id})"),
+                "gmail archive action script finds its message by id in the source mailbox")
+        t.check(actionScript.contains("Mail.accounts.whose({id: job.accountId})")
+                    && actionScript.contains("path === job.srcPath") && actionScript.contains("path === job.destPath"),
+                "gmail archive action script pins the account by id and mailboxes by full path")
+        t.check(actionScript.contains("!== job.mid") && actionScript.contains("sec - job.ds"),
+                "gmail archive action script verifies Message-ID and Date before acting")
+
+        // Mailbox identities from the index (the real layout of a Gmail account).
+        let gmailUUID = "A4273468-266C-4001-B575-AE2F5FFF0D66"
+        let indexBoxes: [(rowID: Int64, url: String)] = [
+            (9, "imap://21419702-19F5-49EE-8611-B22AE82BBCD0/INBOX"),
+            (15, "imap://\(gmailUUID)/%5BGmail%5D/All%20Mail"),
+            (16, "imap://\(gmailUUID)/INBOX"),
+            (21, "imap://\(gmailUUID)/%5BGmail%5D/Trash"),
+            (22, "imap://\(gmailUUID)/%5BGmail%5D/Spam"),
+            (23, "local://4123F0A9-0805-4EE4-B823-16835711F233/Recovered%20Messages%20(Google)")
+        ]
+        let picked = try? gmailArchivePickBoxes(mailboxes: indexBoxes, accountUUID: gmailUUID, accountName: "Google")
+        t.equal(picked, GmailArchiveBoxes(inbox: 16, allMail: 15, trash: 21, recoveredName: "Recovered Messages (Google)", accountUUID: gmailUUID,
+                                          inboxPath: "INBOX", allMailPath: "[Gmail]/All Mail", trashPath: "[Gmail]/Trash"),
+                "archive boxes: INBOX, All Mail, Trash and the quarantine of the right account")
+        t.equal(try? gmailArchivePickBoxes(mailboxes: indexBoxes.filter { $0.rowID != 23 }, accountUUID: gmailUUID,
+                                           accountName: "Google"), picked,
+                "archive boxes: no quarantine mailbox yet is fine")
+        t.check(gmailArchiveIsRecovered(mailboxURL: indexBoxes[5].url, name: "Recovered Messages (Google)")
+                    && !gmailArchiveIsRecovered(mailboxURL: indexBoxes[5].url, name: "Recovered Messages (iCloud)")
+                    && !gmailArchiveIsRecovered(mailboxURL: "imap://\(gmailUUID)/Recovered%20Messages%20(Google)", name: "Recovered Messages (Google)")
+                    && !gmailArchiveIsRecovered(mailboxURL: nil, name: "Recovered Messages (Google)"),
+                "archive boxes: the quarantine is the local mailbox with this account's name only")
+        t.check((try? gmailArchivePickBoxes(mailboxes: indexBoxes.filter { $0.rowID != 21 }, accountUUID: gmailUUID,
+                                            accountName: "Google")) == nil,
+                "archive boxes: no Trash refuses")
+        t.check((try? gmailArchivePickBoxes(mailboxes: indexBoxes + [(30, "imap://\(gmailUUID)/Old/All%20Mail")],
+                                            accountUUID: gmailUUID, accountName: "Google")) == nil,
+                "archive boxes: two All Mail mailboxes refuse")
+
+        // One observation = one statement, on a fixture index with the real
+        // shape: a Gmail INBOX message is an All Mail row plus an INBOX label.
+        // (Recovered=23, All Mail=15, Trash=21, INBOX=16.)
+        let archiveFixture = NSTemporaryDirectory() + "mac-kit-selftest-archive-\(getpid()).sqlite"
+        try? FileManager.default.removeItem(atPath: archiveFixture)
+        var archiveWriter: OpaquePointer?
+        if sqlite3_open(archiveFixture, &archiveWriter) == SQLITE_OK {
+            sqlite3_exec(archiveWriter, """
+                CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, mailbox INTEGER,
+                                       date_sent INTEGER, deleted INTEGER, remote_id INTEGER);
+                CREATE TABLE labels (message_id INTEGER, mailbox_id INTEGER, PRIMARY KEY(message_id, mailbox_id)) WITHOUT ROWID;
+                CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+                INSERT INTO mailboxes VALUES (15, 'imap://A4273468-266C-4001-B575-AE2F5FFF0D66/%5BGmail%5D/All%20Mail');
+                INSERT INTO mailboxes VALUES (16, 'imap://A4273468-266C-4001-B575-AE2F5FFF0D66/INBOX');
+                INSERT INTO mailboxes VALUES (21, 'imap://A4273468-266C-4001-B575-AE2F5FFF0D66/%5BGmail%5D/Trash');
+                INSERT INTO mailboxes VALUES (22, 'imap://A4273468-266C-4001-B575-AE2F5FFF0D66/%5BGmail%5D/Spam');
+                INSERT INTO mailboxes VALUES (23, 'local://4123F0A9-0805-4EE4-B823-16835711F233/Recovered%20Messages%20(Google)');
+                -- 77: in INBOX (All Mail row 500 + INBOX label); 505 is another mail reusing the Message-ID.
+                INSERT INTO messages VALUES (500, 77, 15, 1000, 0, 6000);
+                INSERT INTO labels VALUES (500, 16);
+                INSERT INTO labels VALUES (500, 17);
+                INSERT INTO messages VALUES (505, 77, 15, 9000, 0, 6001);
+                INSERT INTO labels VALUES (505, 16);
+                -- 78: archived cleanly (one All Mail row, no INBOX label).
+                INSERT INTO messages VALUES (510, 78, 15, 1000, 0, 6002);
+                -- 79: only in Recovered Messages.
+                INSERT INTO messages VALUES (520, 79, 23, 1000, 0, NULL);
+                -- 80: mid-refile: All Mail and Trash both listed, plus a deleted All Mail row.
+                INSERT INTO messages VALUES (530, 80, 15, 1000, 1, 6003);
+                INSERT INTO messages VALUES (531, 80, 21, 1000, 0, 901);
+                INSERT INTO messages VALUES (532, 80, 15, 1001, 0, NULL);
+                -- 81: a row with no Date.
+                INSERT INTO messages VALUES (540, 81, 15, NULL, 0, 6004);
+                -- 82: only in Spam (not a place the archive knows).
+                INSERT INTO messages VALUES (550, 82, 22, 1000, 0, 77);
+                -- 83: refiled to All Mail, but a copy also sits in a quarantine mailbox
+                -- that did not exist when the run's mailboxes were resolved (ROWID 40).
+                INSERT INTO mailboxes VALUES (40, 'local://4123F0A9-0805-4EE4-B823-16835711F233/Recovered%20Messages%20(Google)');
+                INSERT INTO messages VALUES (560, 83, 15, 1000, 0, 6005);
+                INSERT INTO messages VALUES (561, 83, 40, 1000, 0, NULL);
+                """, nil, nil, nil)
+        }
+        sqlite3_close(archiveWriter)
+        if let picked, let fixtureDB = try? ReadOnlyDB(path: archiveFixture) {
+            func look(_ hash: Int64) -> GmailArchiveState {
+                gmailArchiveObserve(db: fixtureDB, boxes: picked, messageHash: hash, dateSent: 1000)
+            }
+            let before = fixtureDB.queryCount
+            t.equal(look(77), gs([500], [500], []),
+                    "index: an INBOX message is its All Mail row carrying the INBOX label (other Date ignored)")
+            t.equal(fixtureDB.queryCount - before, 1, "index: one observation runs exactly one statement")
+            t.equal(look(78), gs([], [510], []), "index: an archived message is in All Mail without the INBOX label")
+            t.equal(look(80), gs([], [532], [531], local: [532]),
+                    "index: All Mail + Trash are both reported, a deleted All Mail row is not, and a row without a UID is local-only")
+            t.equal(look(81), GmailArchiveState(inbox: [], allMail: nil, trash: [], recovered: [], synced: nil),
+                    "index: an unreadable Date fails that place closed")
+            t.equal(look(82), gs([], [], []), "index: a copy in some other mailbox is not in any known place")
+            t.equal(look(4242), gs([], [], []), "index: an unknown message is nowhere")
+            t.equal(look(83), gs([], [560], [], [561]),
+                    "index: a quarantine mailbox created after the mailboxes were resolved is still seen")
+            t.equal(gmailArchiveOutcome(deleted: .done, refiled: .done, watermark: 500, state: look(83)), .recovered,
+                    "index: a new All Mail copy plus a copy in a just-created quarantine is not OK")
+            // The rollback guard: a message that sits ONLY in Recovered
+            // Messages must never come out as OK, whatever Mail.app returned.
+            let onlyRecovered = look(79)
+            t.equal(onlyRecovered, gs([], [], [], [520]), "index: a quarantined message is seen in Recovered only")
+            t.check(gmailArchiveOutcome(deleted: .done, refiled: .done, watermark: 500, state: onlyRecovered) != .archived,
+                    "index: only in Recovered Messages is not archived")
+            let unusedClock = { TimeInterval(0) }
+            var deletes = 0
+            let quarantined = gmailArchiveRun(id: 520, env: GmailArchiveEnv(
+                watermark: { 500 }, observe: { look(79) }, delete: { deletes += 1; return .done },
+                refile: { _ in .done }, now: unusedClock, sleep: { _ in }))
+            t.check(quarantined.status != .ok && deletes == 0,
+                    "index: mail_archive on a message only in Recovered Messages reports \(quarantined.status.rawValue), not OK, and deletes nothing")
+        } else {
+            t.check(false, "index: archive fixture could not be opened")
+        }
+        try? FileManager.default.removeItem(atPath: archiveFixture)
+
+        // The whole run against a simulated index. `world` says what the index
+        // shows `sinceDelete` / `sinceRefile` seconds after each call returned
+        // (nil = that call has not happened). The clock only moves in sleep().
+        struct ArchiveSim {
+            var result: GmailArchiveResult
+            var refiledIDs: [Int64]
+            var deletes: Int
+            var elapsed: TimeInterval
+        }
+        func simulate(delete: GmailArchiveStep = .done, refile: GmailArchiveStep = .done, watermark: Int64? = 500,
+                      refileScript: (() -> GmailArchiveStep)? = nil,
+                      world: @escaping (_ sinceDelete: TimeInterval?, _ sinceRefile: TimeInterval?) -> GmailArchiveState) -> ArchiveSim {
+            var clock: TimeInterval = 0
+            var deletedAt: TimeInterval?, refiledAt: TimeInterval?
+            var refiledIDs: [Int64] = []
+            var deletes = 0
+            let env = GmailArchiveEnv(
+                watermark: { watermark },
+                observe: { world(deletedAt.map { clock - $0 }, refiledAt.map { clock - $0 }) },
+                delete: { deletes += 1; if delete != .notAttempted("refused") { deletedAt = clock }; return delete },
+                refile: { id in
+                    refiledIDs.append(id)
+                    let step = refileScript?() ?? refile
+                    if step == .done { refiledAt = clock }
+                    return step
+                },
+                now: { clock },
+                sleep: { clock += $0 })
+            let result = gmailArchiveRun(id: 500, env: env)
+            return ArchiveSim(result: result, refiledIDs: refiledIDs, deletes: deletes, elapsed: clock)
+        }
+        let inInbox = gs([500], [500], [])
+        // Mail.app writes the index late: the Trash copy shows up 2s after the
+        // delete, the refile 3s after the move (passing through All Mail + Trash).
+        func healthy(_ sinceDelete: TimeInterval?, _ sinceRefile: TimeInterval?) -> GmailArchiveState {
+            if let sinceRefile {
+                if sinceRefile < 2 { return gs([], [], [501]) }
+                if sinceRefile < 3 { return gs([], [502], [501]) }
+                return gs([], [502], [])
+            }
+            if let sinceDelete { return sinceDelete < 2 ? gs([], [500], []) : gs([], [], [501]) }
+            return inInbox
+        }
+        let good = simulate(world: healthy)
+        t.equal(good.result.status, .ok, "run: delete, Trash arrival, refile, settled index is OK (\(good.result.message))")
+        t.equal(good.refiledIDs, [501], "run: the refile moves exactly this run's Trash copy")
+        t.check(good.elapsed >= 7 && good.elapsed <= 8, "run: a healthy archive ends once the state has held 2s (took \(good.elapsed)s)")
+
+        // The 2026-11-27 false OK: the refile shows a clean local archive for
+        // 15s — a new All Mail row the server never acknowledges — and then
+        // Mail.app quarantines it.
+        let falseArchive = simulate { sinceDelete, sinceRefile in
+            if let sinceRefile { return sinceRefile < 15 ? gs([], [502], [], local: [502]) : gs([], [], [], [503]) }
+            return healthy(sinceDelete, nil)
+        }
+        t.equal(falseArchive.result.status, .error,
+                "run: a local-only archive that Mail.app later quarantines is an ERROR, never OK")
+        let neverAcked = simulate { sinceDelete, sinceRefile in
+            if sinceRefile != nil { return gs([], [502], [], local: [502]) }
+            return healthy(sinceDelete, nil)
+        }
+        t.equal(neverAcked.result.status, .unknown,
+                "run: an All Mail copy the server never acknowledges is UNKNOWN, not OK")
+        // The Trash copy is only refiled once the server has acknowledged it.
+        let slowTrash = simulate { sinceDelete, sinceRefile in
+            if sinceRefile != nil || sinceDelete == nil { return healthy(sinceDelete, sinceRefile) }
+            if sinceDelete! < 2 { return gs([], [500], []) }
+            return sinceDelete! < 9 ? gs([], [], [501], local: [501]) : gs([], [], [501])
+        }
+        t.equal(slowTrash.result.status, .ok, "run: waits for the server to acknowledge the Trash copy, then archives")
+        t.check(slowTrash.elapsed >= 9 + 5, "run: the refile is not issued before the Trash copy is acknowledged (took \(slowTrash.elapsed)s)")
+        let trashNeverAcked = simulate { sinceDelete, _ in
+            guard let sinceDelete else { return inInbox }
+            return sinceDelete < 2 ? gs([], [500], []) : gs([], [], [501], local: [501])
+        }
+        t.equal(trashNeverAcked.refiledIDs, [], "run: a Trash copy the server never acknowledges is never refiled")
+        t.equal(trashNeverAcked.result.status, .unknown, "run: an unacknowledged Trash copy is UNKNOWN (the server may not have it there)")
+        t.check(trashNeverAcked.result.message.contains("Trash"), "run: ...and the result says where it is")
+
+        let neverLands = simulate { sinceDelete, sinceRefile in
+            if sinceRefile != nil { return gs([], [], []) }
+            return healthy(sinceDelete, nil)
+        }
+        t.check(neverLands.result.status != .ok,
+                "run: gone from every mailbox after the refile is \(neverLands.result.status.rawValue), never OK")
+        let quarantine = simulate { sinceDelete, sinceRefile in
+            if sinceRefile != nil { return gs([], [], [], [502]) }
+            return healthy(sinceDelete, nil)
+        }
+        t.equal(quarantine.result.status, .error, "run: quarantined into Recovered Messages by the refile is an ERROR")
+        t.check(quarantine.result.message.contains("Recovered Messages"), "run: the quarantine is named in the result")
+        let lagging = simulate { sinceDelete, sinceRefile in
+            if sinceRefile != nil { return gs([], [], [501]) }
+            return healthy(sinceDelete, nil)
+        }
+        t.equal(lagging.result.status, .error, "run: an index that still shows Trash when the window ends is not OK")
+        let staleAllMail = simulate { sinceDelete, sinceRefile in
+            if sinceRefile != nil { return gs([], [500], []) }
+            return healthy(sinceDelete, nil)
+        }
+        t.equal(staleAllMail.result.status, .unknown,
+                "run: INBOX gone + the OLD All Mail row (no new copy) is UNKNOWN, not OK")
+        let bounces = simulate { sinceDelete, sinceRefile in
+            if let sinceRefile { return sinceRefile < 1.5 ? gs([], [502], []) : gs([502], [502], []) }
+            return healthy(sinceDelete, nil)
+        }
+        t.equal(bounces.result.status, .error, "run: archived for a moment, then back in INBOX, is not OK")
+        let noArrival = simulate { sinceDelete, _ in sinceDelete == nil ? inInbox : gs([], [500], []) }
+        t.equal(noArrival.result.status, .unknown, "run: no Trash arrival is UNKNOWN (INBOX gone + All Mail present proves nothing)")
+        t.equal(noArrival.refiledIDs, [], "run: nothing is refiled without a seen arrival")
+        let oldTrashOnly = simulate { sinceDelete, _ in sinceDelete == nil ? inInbox : gs([], [], [480]) }
+        t.equal(oldTrashOnly.refiledIDs, [], "run: a Trash copy that predates the run is never refiled")
+        t.check(oldTrashOnly.result.status != .ok, "run: a pre-existing Trash copy is not an arrival")
+        let twoArrivals = simulate { sinceDelete, _ in sinceDelete == nil ? inInbox : gs([], [], [501, 502]) }
+        t.equal(twoArrivals.result.status, .ambiguous, "run: two new Trash copies are AMBIGUOUS")
+        t.equal(twoArrivals.refiledIDs, [], "run: nothing is refiled when the arrival is ambiguous")
+
+        let notInInboxEarly = simulate { _, _ in gs([], [500], []) }
+        let deleteRefused = simulate(delete: .notAttempted("refused")) { _, _ in inInbox }
+        t.equal(deleteRefused.result.status, .error, "run: a refused delete is an ERROR")
+        t.check(deleteRefused.result.message.contains("nothing was changed") && deleteRefused.refiledIDs.isEmpty,
+                "run: a refused delete changes nothing and refiles nothing")
+        let deleteTimedOut = simulate(delete: .indeterminate("timed out"), world: healthy)
+        t.equal(deleteTimedOut.result.status, .unknown, "run: a timed-out delete is UNKNOWN even when the index ends up archived")
+        t.equal(deleteTimedOut.refiledIDs, [501], "run: a timed-out delete's Trash arrival is still refiled, not stranded")
+        t.check(deleteTimedOut.result.stopBatch, "run: a timed-out delete stops the rest of the batch")
+        let refileTimedOut = simulate(refile: .indeterminate("timed out")) { sinceDelete, _ in
+            // the refile is never marked as returned, so model its effect by time since the delete
+            guard let sinceDelete else { return inInbox }
+            return sinceDelete < 2 ? gs([], [500], []) : (sinceDelete < 4 ? gs([], [], [501]) : gs([], [502], []))
+        }
+        t.equal(refileTimedOut.result.status, .unknown, "run: a timed-out refile is UNKNOWN even when the index ends up archived")
+        t.check(refileTimedOut.result.stopBatch, "run: a timed-out refile stops the rest of the batch")
+        let refileRefused = simulate(refile: .notAttempted("not found")) { sinceDelete, _ in healthy(sinceDelete, nil) }
+        t.equal(refileRefused.result.status, .error, "run: a refused refile leaves it in Trash: ERROR")
+        t.check(refileRefused.result.message.contains("Trash"), "run: a refused refile says the message is in Trash")
+        t.check(refileRefused.refiledIDs.count >= 20 && Set(refileRefused.refiledIDs) == [501],
+                "run: a refused refile is retried for the whole refile window, then given up (\(refileRefused.refiledIDs.count) tries)")
+        t.check(refileRefused.result.stopBatch, "run: a message left in Trash stops the rest of the batch")
+        // Mail.app's scripting model shows the Trash row only 6s after the index does.
+        var refusals = 0
+        let lateModel = simulate(refileScript: { refusals += 1; return refusals <= 6 ? .notAttempted("not found") : .done }, world: healthy)
+        t.equal(lateModel.result.status, .ok, "run: a refile refused for a few seconds is retried until Mail.app sees the row")
+        t.check(!good.result.stopBatch && !deleteRefused.result.stopBatch && !notInInboxEarly.result.stopBatch,
+                "run: an OK, a refused delete and a not-in-INBOX message do not stop the batch")
+        for (name, sim) in [("gone everywhere", neverLands), ("quarantined", quarantine), ("still in Trash", lagging),
+                            ("no arrival", noArrival), ("two arrivals", twoArrivals), ("Trash never acknowledged", trashNeverAcked),
+                            ("All Mail never acknowledged", neverAcked)] {
+            t.check(sim.result.status != .ok && sim.result.stopBatch,
+                    "run: \(name) — taken out of INBOX without a confirmed archive — stops the rest of the batch")
+        }
+
+        let notInInbox = simulate { _, _ in gs([], [500], []) }
+        t.equal(notInInbox.result.status, .error, "run: a message that is not in INBOX is an ERROR")
+        t.equal(notInInbox.deletes, 0, "run: nothing is deleted when the message is not in INBOX")
+        let preTrash = simulate { _, _ in gs([500], [500], [480]) }
+        t.equal(preTrash.result.status, .ambiguous, "run: a Trash copy before the run is AMBIGUOUS")
+        t.equal(preTrash.deletes, 0, "run: nothing is deleted when the baseline is ambiguous")
+        let unreadable = simulate { _, _ in .unreadable }
+        t.equal(unreadable.result.status, .unknown, "run: an unreadable index is UNKNOWN")
+        t.equal(unreadable.deletes, 0, "run: nothing is deleted when the index cannot be read")
+        let noWatermark = simulate(watermark: nil, world: healthy)
+        t.equal(noWatermark.result.status, .unknown, "run: no watermark is UNKNOWN")
+        t.equal(noWatermark.deletes, 0, "run: nothing is deleted without a watermark")
 
         // MARK: mail_rescue_recovered (end state in the index, not the move call)
         //
